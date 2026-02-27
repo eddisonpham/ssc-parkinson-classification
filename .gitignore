@@ -1,0 +1,15 @@
+# Ignore data files
+*.csv
+*.CSV
+*.tsv
+*.TSV
+*.xls
+*.XLS
+*.xlsx
+*.XLSX
+
+# Ignore virtual environments
+.venv/
+venv/
+env/
+.env/
