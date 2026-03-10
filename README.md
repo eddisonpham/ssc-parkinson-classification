@@ -13,10 +13,7 @@ This repository now contains:
 ## Repository Structure
 ```text
 ssc-case-study-parkinson-classification/
-├── INSTRUCTION.md
 ├── README.md
-├── README2.md
-├── Parkinsons_Classification_Literature_Review.md
 ├── configs/
 │   ├── default_experiment.yaml
 │   └── advanced_experiment.yaml
