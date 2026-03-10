@@ -1,0 +1,23 @@
+target: binary
+random_seed: 42
+test_size: 0.2
+missingness_threshold: 0.65
+site_holdout: null
+tables:
+  - demographic.csv
+  - clinical.csv
+  - epidemiological.csv
+  - medication.csv
+  - moca.csv
+  - mds-updrs.csv
+  - apathy_scale.csv
+  - bai.csv
+  - bdii.csv
+  - fatigue_severity_scale.csv
+  - pdq_8.csv
+  - pdq_39.csv
+  - scopa.csv
+  - timed_up_go.csv
+  - parkinson_severity_scale.csv
+  - schwab_&_england.csv
+  - ehi.csv

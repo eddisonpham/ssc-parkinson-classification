@@ -1,0 +1,16 @@
+{
+  "target": "binary",
+  "samples": 3023,
+  "original_feature_count": 224,
+  "text_column_count": 147,
+  "numeric_column_count": 77,
+  "tfidf_feature_count": 3603,
+  "combined_feature_count": 3680,
+  "selected_feature_count": 165,
+  "selected_text_feature_count": 94,
+  "selected_numeric_feature_count": 71,
+  "max_text_features": 5000,
+  "min_df": 5,
+  "selector_c": 0.5,
+  "random_seed": 42
+}
