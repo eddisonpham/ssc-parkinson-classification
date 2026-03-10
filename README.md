@@ -1,15 +1,16 @@
-# Repository Guide And Methodology
+# Parkinson Versus Atypical Parkinsonism Classification
 
-## Purpose
-This repository is an experimental case-study workspace for classifying Parkinson's disease (`PD`) versus atypical parkinsonism (`AP`) using Canadian Open Parkinson Network baseline data. The current codebase is organized to support three things:
+Experimental case-study repository for classifying Parkinson's disease (`PD`) versus atypical parkinsonism (`AP`) using Canadian Open Parkinson Network (`C-OPN`) baseline data.
 
-1. Fast exploratory data analysis over the CSV bundle in `data/ssc_data/`
-2. Reproducible preprocessing with explicit leakage controls
-3. Benchmarking several baseline classifiers for the clinically important `PD` vs `AP` task
+This repository now contains:
+- reusable preprocessing and schema-audit utilities
+- exploratory analysis for the multi-table C-OPN snapshot
+- baseline and expanded tabular model benchmarks
+- text-aware feature selection for non-numeric clinical responses
+- a separate non-neural mixture-of-experts pipeline
+- a separate evaluation and graph-generation pipeline with publication-style plots
 
-The original literature context lives in `Parkinsons_Classification_Literature_Review.md`, and the case-study framing lives in `README.md` and `INSTRUCTION.md`.
-
-## Current Repository Layout
+## Repository Structure
 ```text
 ssc-case-study-parkinson-classification/
 ├── INSTRUCTION.md
@@ -17,211 +18,239 @@ ssc-case-study-parkinson-classification/
 ├── README2.md
 ├── Parkinsons_Classification_Literature_Review.md
 ├── configs/
-│   └── default_experiment.yaml
+│   ├── default_experiment.yaml
+│   └── advanced_experiment.yaml
 ├── data/
 │   ├── __init__.py
 │   ├── data_preprocessing.py
 │   ├── exploratory_data_analysis.ipynb
 │   └── ssc_data/
-│       ├── enrollement.csv
-│       ├── demographic.csv
-│       ├── clinical.csv
-│       ├── epidemiological.csv
-│       ├── medication.csv
-│       ├── moca.csv
-│       ├── mds-updrs.csv
-│       ├── ...
+├── evaluation/
+│   └── plots/
+│       ├── config.py
+│       ├── data_loading.py
+│       ├── discussion_plan.md
+│       ├── generate_plots.py
+│       ├── plotting.py
+│       ├── refresh_results.py
+│       └── output/
 ├── results/
-│   ├── classification_reports.json
-│   ├── experiment_summary.json
-│   ├── model_comparison.csv
-│   └── model_comparison.md
 ├── scripts/
-│   └── train_models.py
+│   ├── feature_selection.py
+│   ├── train_models.py
+│   ├── train_mixture_of_experts.py
+│   └── train_state_of_the_art_models.py
 └── requirements.txt
 ```
 
-## Data Assets
-The raw data bundle is baseline-only in the current workspace snapshot, and the tables join cleanly on `Project key`.
+## Dataset Summary
+The current repository snapshot is a baseline-only, patient-level, multi-table export keyed by `Project key`.
 
-Observed baseline cohort counts from `enrollement.csv`:
+Observed cohort counts from `enrollement.csv`:
+- `PD`: `2852`
+- `AP`: `171`
+- `HC`: `410`
+- missing cohort label: `108`
 
-- `PD`: 2,852
-- `AP`: 171
-- `Healthy control`: 410
-- Missing enrolment group: 108
-
-Important label sources:
-
-- Primary modeling label: `Enrolment Group` in `data/ssc_data/enrollement.csv`
-- AP subtype detail: diagnosis-specific fields in `data/ssc_data/clinical.csv`
+Primary label sources:
+- cohort-level group label from `data/ssc_data/enrollement.csv`
+- AP subtype detail from `data/ssc_data/clinical.csv`
 
 Important caveat:
+- the project brief references a data dictionary and an Excel workbook, but no authoritative data dictionary is present in this workspace
+- implementation-level mapping in the analysis is therefore provisional
 
-- The instructions mention a data dictionary and an Excel workbook, but no usable data dictionary file is present in the current workspace. Because of that, implementation-level mapping is provisional and based on the README definitions plus the nature of each questionnaire or assessment.
+## Preprocessing Design
+The preprocessing logic lives in `data/data_preprocessing.py`.
 
-## Methodology
-### 1. Target definition
-The code supports:
+Key design choices:
+- patient-level merge on `Project key`
+- feature names always include the source CSV prefix
+- duplicate normalized headers from the same CSV are disambiguated with suffixes such as `__dup2`
+- diagnosis-leakage columns from `clinical.csv` are explicitly removed before modeling
+- default modeling filter drops features with more than `65%` missingness
+- numeric features use median imputation
+- categorical features use most-frequent imputation plus one-hot encoding
 
-- Binary target: `PD` vs `AP`
-- Multiclass target: `PD` vs `AP` vs `HC`
+This keeps the pipeline reproducible and avoids accidental target leakage.
 
-The default experiment focuses on the primary case-study task, `PD` vs `AP`, and excludes `HC` from training.
+## Modeling Pipelines
+### 1. Baseline benchmark
+`scripts/train_models.py`
 
-### 2. Feature assembly
-`data/data_preprocessing.py` builds a patient-level master table by:
+Benchmarks:
+- logistic regression
+- random forest
+- extra trees
+- RBF SVM
+- histogram gradient boosting
 
-- Loading enrollment metadata and target labels
-- Merging selected baseline CSVs on `Project key`
-- Prefixing feature names by source table
-- Removing operational metadata fields that are not useful predictors
+Primary outputs:
+- `results/model_comparison.csv`
+- `results/model_comparison.md`
+- `results/classification_reports.json`
+- `results/experiment_summary.json`
 
-The default feature bundle uses:
+### 2. Text-aware feature selection
+`scripts/feature_selection.py`
 
-- `demographic.csv`
-- `clinical.csv`
-- `epidemiological.csv`
-- `medication.csv`
-- `moca.csv`
-- `mds-updrs.csv`
-- `apathy_scale.csv`
-- `bai.csv`
-- `bdii.csv`
-- `fatigue_severity_scale.csv`
-- `pdq_8.csv`
-- `pdq_39.csv`
-- `scopa.csv`
-- `timed_up_go.csv`
-- `parkinson_severity_scale.csv`
-- `schwab_&_england.csv`
-- `ehi.csv`
+This pipeline handles the large number of non-numeric C-OPN columns by:
+- converting row-level non-numeric fields into `column=value` text tokens
+- vectorizing them with TF-IDF
+- combining those with numeric features
+- selecting features via a sparse linear selector
+- fitting a final logistic model on the selected set
 
-### 3. Leakage control
-Direct diagnosis fields from `clinical.csv` are explicitly removed before modeling, including:
+Primary outputs:
+- `results/selected_features.csv`
+- `results/feature_selection_summary.json`
+- `results/feature_selection_metrics.json`
+- `results/feature_selection_predictions.csv`
+- `results/feature_selection.md`
 
-- diagnosed/not diagnosed flags
-- diagnosis subtype fields
-- diagnosis certainty fields
-- diagnosis confirmation fields
-- diagnosis dates and diagnosis-age fields
+### 3. Expanded state-of-the-art tabular benchmark
+`scripts/train_state_of_the_art_models.py`
 
-This is important because those fields would otherwise let the model recover the label directly instead of learning clinically relevant patterns.
+Models benchmarked:
+- logistic regression
+- random forest
+- extra trees
+- RBF SVM
+- histogram gradient boosting
+- balanced random forest
+- easy ensemble
+- XGBoost hist
+- XGBoost deeper variant
+- LightGBM GBDT
+- LightGBM extra-trees variant
+- CatBoost
 
-### 4. Missing data handling
-The dataset is highly sparse, which is expected for this case study. The current pipeline handles this by:
+Primary outputs:
+- `results/sota_model_comparison.csv`
+- `results/sota_model_comparison.md`
+- `results/sota_predictions.csv`
+- `results/sota_classification_reports.json`
+- `results/sota_experiment_summary.json`
 
-- dropping features with more than `65%` missingness
-- keeping only non-constant features
-- using median imputation for numeric fields
-- using most-frequent imputation for categorical fields
-- applying one-hot encoding to categorical variables
+### 4. Non-neural mixture of experts
+`scripts/train_mixture_of_experts.py`
 
-This is intentionally conservative and easy to audit.
+This is a separate, disjoint expert-based pipeline. It trains experts on different feature families:
+- low-burden demographic and exposure features
+- clinical and treatment features
+- motor and cognition features
+- questionnaire features
 
-### 5. Model comparison strategy
-The default training script benchmarks five baseline models:
+A classical logistic regression gate combines expert probabilities. No neural networks are used.
 
-- Logistic regression
-- Random forest
-- Extra trees
-- RBF-kernel SVM
-- Histogram gradient boosting
+Primary outputs:
+- `results/mixture_of_experts_comparison.csv`
+- `results/mixture_of_experts_comparison.md`
+- `results/mixture_of_experts_predictions.csv`
+- `results/mixture_of_experts_reports.json`
+- `results/mixture_of_experts_summary.json`
 
-The evaluation split is currently:
+## Current Results
+All current benchmark results were refreshed together, as recorded in `results/result_manifest.json`.
 
-- stratified random train/test split
-- `80/20` split
-- fixed seed `42`
+### Data used in the main binary task
+- labeled `PD/AP` samples: `3023`
+- retained tabular features after default filtering: `224`
+- class distribution: `2852 PD`, `171 AP`
 
-The CLI also supports optional site-based holdout evaluation through `--site-holdout`.
+### Best baseline result
+From `results/model_comparison.md`:
+- `svc_rbf`: balanced accuracy `0.6479`, AP recall `0.5882`, AUC `0.7110`
 
-### 6. Metric emphasis
-Because `AP` is the rare but clinically important class, the primary ranking signal is not plain accuracy alone. The results emphasize:
+### Best expanded benchmark result
+From `results/sota_model_comparison.md`:
+- `easy_ensemble`: balanced accuracy `0.7606`, AP recall `0.9118`, AUC `0.8509`
 
-- balanced accuracy
-- AP sensitivity/recall
-- PD specificity
-- AUC-ROC
+Other strong expanded models:
+- `catboost`: balanced accuracy `0.6959`, AUC `0.8224`
+- `xgboost_hist`: balanced accuracy `0.6945`, AUC `0.7934`
+- `balanced_random_forest`: balanced accuracy `0.6915`, AUC `0.8220`
 
-## Current Experimental Results
-The current default binary experiment used:
+### Text-aware feature-selection result
+From `results/feature_selection.md`:
+- balanced accuracy `0.7535`
+- AUC `0.8067`
+- selected features: `165`
+- selected text-derived features: `94`
+- selected numeric features: `71`
 
-- `3023` labeled `PD/AP` samples
-- `224` retained features after filtering
-- class distribution of `2852 PD` and `171 AP`
-
-Best observed models from `results/model_comparison.md`:
-
-| Model | Accuracy | Balanced Accuracy | AP Recall | AUC |
-| --- | --- | --- | --- | --- |
-| `svc_rbf` | 0.7008 | 0.6479 | 0.5882 | 0.7110 |
-| `logistic_regression` | 0.7752 | 0.6458 | 0.5000 | 0.7613 |
-| `hist_gradient_boosting` | 0.9455 | 0.5700 | 0.1471 | 0.8225 |
+### Mixture-of-experts result
+From `results/mixture_of_experts_comparison.md`:
+- `mixture_of_experts_gate`: balanced accuracy `0.6537`, AUC `0.7809`
 
 Interpretation:
+- the separate expert decomposition is useful analytically and interpretively
+- the strongest single-model benchmark still outperforms the current gated MoE pipeline
 
-- `HistGradientBoosting` achieves the highest raw accuracy and AUC, but it misses many AP cases.
-- `SVC` gives the best AP sensitivity in the current benchmark, which may matter more clinically.
-- `LogisticRegression` is a strong implementation-friendly baseline because it is simpler and nearly matches the best balanced accuracy.
+## Evaluation And Plotting
+The evaluation pipeline is intentionally separate from the modeling scripts.
 
-## File-by-File Purpose
-### `data/data_preprocessing.py`
-Core data utility module. It provides:
+Files:
+- `evaluation/plots/refresh_results.py`
+- `evaluation/plots/generate_plots.py`
+- `evaluation/plots/discussion_plan.md`
 
-- table catalog metadata
-- schema summaries for EDA
-- cohort/label extraction
-- merged feature-table construction
-- missingness summaries
-- prepared modeling datasets for binary or multiclass experiments
+What it does:
+- refreshes the latest model results before plotting
+- loads refreshed result artifacts only
+- generates neat, reusable `plotnine` figures into `evaluation/plots/output`
+- supports discussion around imbalance, sparsity, trade-offs, implementation burden, text-derived signals, and expert decomposition
 
-### `data/exploratory_data_analysis.ipynb`
-Notebook entry point for:
-
-- listing each CSV and its role
-- inspecting schema and missingness
-- confirming target variables
-- reviewing candidate feature groups
-
-### `scripts/train_models.py`
-Main experiment runner. It:
-
-- reads config from `configs/default_experiment.yaml`
-- prepares the dataset
-- performs train/test splitting
-- trains the model set
-- writes metrics and reports into `results/`
-
-### `results/`
-Generated benchmark outputs:
-
-- `model_comparison.csv`: machine-readable summary table
-- `model_comparison.md`: readable summary for the repo
-- `classification_reports.json`: per-model class metrics
-- `experiment_summary.json`: dataset and split metadata
+Generated plot set currently includes:
+- cohort balance
+- site distribution
+- table sparsity
+- table width versus missingness
+- balanced accuracy across pipelines
+- AP recall versus PD specificity trade-off
+- AUC versus balanced accuracy
+- advanced-model metric heatmap
+- implementation complexity versus performance
+- feature-selection composition
+- top selected features
+- MoE component performance
+- expert feature count versus performance
+- ROC curves
+- precision-recall curves
+- average performance by model family
 
 ## How To Run
-Run the default benchmark:
-
+### Baseline benchmark
 ```bash
 python scripts/train_models.py
 ```
 
-Run a multiclass benchmark:
-
+### Text-aware feature selection
 ```bash
-python scripts/train_models.py --target multiclass
+python scripts/feature_selection.py
 ```
 
-Run a site holdout experiment:
-
+### Expanded tabular benchmark
 ```bash
-python scripts/train_models.py --site-holdout "<site name>"
+python scripts/train_state_of_the_art_models.py
 ```
 
-## Recommended Next Iterations
-- Add a dedicated Level 1 and Level 2 feature subset once the formal data dictionary is available.
-- Compare random split performance against site holdout performance.
-- Add calibrated threshold tuning for AP sensitivity, since recall is more important than raw accuracy for the rare class.
-- Explore multiclass performance only after the binary AP-sensitive baseline is stable.
+### Non-neural mixture of experts
+```bash
+python scripts/train_mixture_of_experts.py
+```
+
+### Refresh all results
+```bash
+python evaluation/plots/refresh_results.py
+```
+
+### Generate all evaluation plots
+```bash
+python evaluation/plots/generate_plots.py
+```
+
+## Notes
+- the main clinical task remains `PD` versus `AP`
+- model ranking emphasizes `balanced_accuracy`, `AP recall`, and `AUC-ROC` instead of raw accuracy alone
+- the repository is experimental, but the codebase is now organized around reusable preprocessing, modeling, and evaluation components
