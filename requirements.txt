@@ -28,6 +28,7 @@ pandas==3.0.1
 patsy==1.0.2
 pillow==12.1.1
 plotly==6.5.2
+plotnine==0.15.3
 pyparsing==3.3.2
 python-dateutil==2.9.0.post0
 PyYAML==6.0.3

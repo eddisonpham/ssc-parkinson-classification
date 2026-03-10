@@ -13,3 +13,10 @@
 venv/
 env/
 .env/
+INSTRUCTION.md
+*.pdf
+README2.md
+Parkinsons_Classification_Literature_Review.md
+
+__pycache__/
+*/__pycache__/
