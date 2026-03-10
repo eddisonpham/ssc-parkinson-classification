@@ -1,0 +1,36 @@
+{
+  "target": "binary",
+  "tables": [
+    "demographic.csv",
+    "clinical.csv",
+    "epidemiological.csv",
+    "medication.csv",
+    "moca.csv",
+    "mds-updrs.csv",
+    "apathy_scale.csv",
+    "bai.csv",
+    "bdii.csv",
+    "fatigue_severity_scale.csv",
+    "pdq_8.csv",
+    "pdq_39.csv",
+    "scopa.csv",
+    "timed_up_go.csv",
+    "parkinson_severity_scale.csv",
+    "schwab_&_england.csv",
+    "ehi.csv"
+  ],
+  "missingness_threshold": 0.65,
+  "random_seed": 42,
+  "feature_count": 224,
+  "sample_count": 3023,
+  "class_distribution": {
+    "0": 2852,
+    "1": 171
+  },
+  "split": {
+    "split_type": "stratified_random_split",
+    "train_size": 2418,
+    "test_size": 605,
+    "test_fraction": 0.2
+  }
+}

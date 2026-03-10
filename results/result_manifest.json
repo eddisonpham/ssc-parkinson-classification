@@ -1,0 +1,9 @@
+{
+  "generated_at_utc": "2026-03-09T05:29:41.044161+00:00",
+  "commands": [
+    "/Users/eddisonpham/miniconda3/bin/python /Users/eddisonpham/Projects/ssc-case-study-parkinson-classification/scripts/train_models.py",
+    "/Users/eddisonpham/miniconda3/bin/python /Users/eddisonpham/Projects/ssc-case-study-parkinson-classification/scripts/feature_selection.py",
+    "/Users/eddisonpham/miniconda3/bin/python /Users/eddisonpham/Projects/ssc-case-study-parkinson-classification/scripts/train_state_of_the_art_models.py",
+    "/Users/eddisonpham/miniconda3/bin/python /Users/eddisonpham/Projects/ssc-case-study-parkinson-classification/scripts/train_mixture_of_experts.py"
+  ]
+}
