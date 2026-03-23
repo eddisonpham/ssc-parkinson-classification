@@ -20,3 +20,5 @@ Parkinsons_Classification_Literature_Review.md
 
 __pycache__/
 */__pycache__/
+results*/
+logs/

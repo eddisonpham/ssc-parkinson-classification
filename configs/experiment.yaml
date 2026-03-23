@@ -1,0 +1,88 @@
+# experiment.yaml
+# -----------------
+# Single source-of-truth experiment config for the C-OPN pipeline.
+#
+# The DR condition is intentionally left null here.
+# run_experiments.sh generates per-run overrides programmatically.
+# Set dimensionality_reduction to a block (see commented examples below)
+# only when running a single ad-hoc experiment.
+
+target: binary
+random_seed: 42
+test_size: 0.2
+missingness_threshold: 0.65
+site_holdout: null
+
+tables:
+  - demographic.csv
+  - clinical.csv
+  - epidemiological.csv
+  - medication.csv
+  - moca.csv
+  - mds-updrs.csv
+  - apathy_scale.csv
+  - bai.csv
+  - bdii.csv
+  - fatigue_severity_scale.csv
+  - pdq_8.csv
+  - pdq_39.csv
+  - scopa.csv
+  - timed_up_go.csv
+  - parkinson_severity_scale.csv
+  - schwab_&_england.csv
+  - ehi.csv
+
+# -----------------------------------------------------------------
+# Dimensionality reduction (optional)
+#
+# Leave as null to use raw features (original behaviour).
+# The sweep script overrides this key per run.
+#
+# Quick examples:
+#
+# dimensionality_reduction:           # FAMD only
+#   mode: sequential
+#   methods:
+#     - type: famd
+#       n_components: 80
+#       categorical_threshold: 20
+#
+# dimensionality_reduction:           # Recommended: FAMD → Hellinger
+#   mode: sequential
+#   methods:
+#     - type: famd
+#       n_components: 80
+#       categorical_threshold: 20
+#     - type: hellinger
+#       n_features: 60
+#       n_bins: 10
+#       use_svm_refinement: true
+#       svm_top_k: 300
+#       svm_c: 0.5
+#
+# dimensionality_reduction:           # Hellinger only (fast imbalance-aware selector)
+#   mode: sequential
+#   methods:
+#     - type: hellinger
+#       n_features: 100
+#       use_svm_refinement: true
+#
+# dimensionality_reduction:           # CATPCA for Likert-heavy tables
+#   mode: sequential
+#   methods:
+#     - type: catpca
+#       n_components: 60
+#       max_iter: 30
+#
+# dimensionality_reduction:           # TF-IDF + Hellinger (parallel)
+#   mode: parallel
+#   keep_original_numeric: true
+#   methods:
+#     - type: tfidf_embedding
+#       n_components: 50
+#       max_features: 3000
+#       min_df: 3
+#     - type: hellinger
+#       n_features: 60
+# -----------------------------------------------------------------
+dimensionality_reduction: null

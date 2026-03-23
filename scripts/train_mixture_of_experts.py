@@ -182,6 +182,10 @@ def main() -> None:
         target=args.target,
         tables=DEFAULT_FEATURE_TABLES,
         missingness_threshold=args.missingness_threshold,
+        # DR is intentionally disabled for the MoE pipeline: each expert is
+        # trained on a disjoint feature-family prefix, and applying a global
+        # DR step before splitting by prefix would break that partitioning.
+        dr_config=None,
     )
 
     X_outer_train, X_test, y_outer_train, y_test = train_test_split(

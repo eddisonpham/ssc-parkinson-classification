@@ -4,6 +4,7 @@ Experimental case-study repository for classifying Parkinson's disease (`PD`) ve
 
 This repository now contains:
 - reusable preprocessing and schema-audit utilities
+- **modular dimensionality-reduction (DR) pipeline** with 7 interchangeable methods
 - exploratory analysis for the multi-table C-OPN snapshot
 - baseline and expanded tabular model benchmarks
 - text-aware feature selection for non-numeric clinical responses
@@ -14,12 +15,14 @@ This repository now contains:
 ```text
 ssc-case-study-parkinson-classification/
 ├── README.md
+├── DIMENSIONALITY_REDUCTION.md       ← NEW: DR method documentation
 ├── configs/
-│   ├── default_experiment.yaml
-│   └── advanced_experiment.yaml
+│   ├── default_experiment.yaml       ← updated: DR config blocks
+│   └── advanced_experiment.yaml      ← updated: FAMD+Hellinger as default
 ├── data/
 │   ├── __init__.py
-│   ├── data_preprocessing.py
+│   ├── data_preprocessing.py         ← updated: dr_config parameter + PreparedDataset fields
+│   ├── dimensionality_reduction.py   ← NEW: all DR methods
 │   ├── exploratory_data_analysis.ipynb
 │   └── ssc_data/
 ├── evaluation/
@@ -33,10 +36,10 @@ ssc-case-study-parkinson-classification/
 │       └── output/
 ├── results/
 ├── scripts/
-│   ├── feature_selection.py
-│   ├── train_models.py
+│   ├── feature_selection.py          ← updated: --config arg for DR
+│   ├── train_models.py               ← updated: dr_config threading
 │   ├── train_mixture_of_experts.py
-│   └── train_state_of_the_art_models.py
+│   └── train_state_of_the_art_models.py  ← updated: dr_config threading
 └── requirements.txt
 ```
 
@@ -69,7 +72,71 @@ Key design choices:
 - numeric features use median imputation
 - categorical features use most-frequent imputation plus one-hot encoding
 
-This keeps the pipeline reproducible and avoids accidental target leakage.
+### DR Integration Hook
+
+`prepare_modeling_dataset` now accepts an optional `dr_config` parameter:
+
+```python
+prepared = prepare_modeling_dataset(
+    target="binary",
+    dr_config={
+        "mode": "sequential",
+        "methods": [
+            {"type": "famd",      "n_components": 80},
+            {"type": "hellinger", "n_features":   60},
+        ],
+    },
+)
+print(prepared.dr_applied)    # True
+print(prepared.X.shape)        # reduced feature matrix
+```
+
+Pass `dr_config=None` (default) to preserve original behaviour.
+
+## Dimensionality Reduction Pipeline
+
+See [`DIMENSIONALITY_REDUCTION.md`](DIMENSIONALITY_REDUCTION.md) for full documentation.
+
+### Available Methods
+
+| Method | Class | Papers | Best For |
+|---|---|---|---|
+| MCA | `MCAReducer` | [1] | Categorical-only columns |
+| FAMD | `FAMDReducer` | [1, 2] | Mixed numeric + categorical (default) |
+| CATPCA | `CATSCAReducer` | [1, 2] | Likert/ordinal questionnaire columns |
+| Hellinger (sssHD) | `HellingerSelector` | [3] | Extreme class imbalance |
+| TF-IDF + LSA | `TFIDFEmbeddingReducer` | — | Bilingual MCQ / free text (lightweight) |
+| LLM + PCA | `LLMEmbeddingReducer` | [5] | Semantic text (requires sentence-transformers) |
+| MRL Truncation | `MRLEmbeddingReducer` | [4] | Semantic text, tunable dim |
+
+### Enabling DR via YAML
+
+```yaml
+# configs/advanced_experiment.yaml
+dimensionality_reduction:
+  mode: sequential
+  methods:
+    - type: famd
+      n_components: 80
+    - type: hellinger
+      n_features: 60
+      use_svm_refinement: true
+```
+
+Set `dimensionality_reduction: null` to disable.
+
+### Ablation Studies
+
+All DR methods are independently composable. Swap a single entry in the YAML
+`methods` list and re-run to isolate each method's contribution:
+
+```bash
+# Run with FAMD + Hellinger (advanced_experiment.yaml default)
+python scripts/train_state_of_the_art_models.py
+
+# Run without DR (null in yaml)
+python scripts/train_state_of_the_art_models.py --config configs/default_experiment.yaml
+```
 
 ## Modeling Pipelines
 ### 1. Baseline benchmark
@@ -97,6 +164,8 @@ This pipeline handles the large number of non-numeric C-OPN columns by:
 - combining those with numeric features
 - selecting features via a sparse linear selector
 - fitting a final logistic model on the selected set
+
+Now accepts `--config` to apply DR before feature selection.
 
 Primary outputs:
 - `results/selected_features.csv`
@@ -138,7 +207,7 @@ This is a separate, disjoint expert-based pipeline. It trains experts on differe
 - motor and cognition features
 - questionnaire features
 
-A classical logistic regression gate combines expert probabilities. No neural networks are used.
+A classical logistic regression gate combines expert probabilities.  DR is intentionally not applied in the MoE pipeline because experts rely on feature-family provenance (column prefix) to partition inputs.
 
 Primary outputs:
 - `results/mixture_of_experts_comparison.csv`
@@ -180,10 +249,6 @@ From `results/feature_selection.md`:
 From `results/mixture_of_experts_comparison.md`:
 - `mixture_of_experts_gate`: balanced accuracy `0.6537`, AUC `0.7809`
 
-Interpretation:
-- the separate expert decomposition is useful analytically and interpretively
-- the strongest single-model benchmark still outperforms the current gated MoE pipeline
-
 ## Evaluation And Plotting
 The evaluation pipeline is intentionally separate from the modeling scripts.
 
@@ -192,39 +257,21 @@ Files:
 - `evaluation/plots/generate_plots.py`
 - `evaluation/plots/discussion_plan.md`
 
-What it does:
-- refreshes the latest model results before plotting
-- loads refreshed result artifacts only
-- generates neat, reusable `plotnine` figures into `evaluation/plots/output`
-- supports discussion around imbalance, sparsity, trade-offs, implementation burden, text-derived signals, and expert decomposition
-
-Generated plot set currently includes:
-- cohort balance
-- site distribution
-- table sparsity
-- table width versus missingness
-- balanced accuracy across pipelines
-- AP recall versus PD specificity trade-off
-- AUC versus balanced accuracy
-- advanced-model metric heatmap
-- implementation complexity versus performance
-- feature-selection composition
-- top selected features
-- MoE component performance
-- expert feature count versus performance
-- ROC curves
-- precision-recall curves
-- average performance by model family
-
 ## How To Run
 ### Baseline benchmark
 ```bash
 python scripts/train_models.py
 ```
 
-### Text-aware feature selection
+### Baseline with DR enabled
+```bash
+python scripts/train_models.py --config configs/advanced_experiment.yaml
+```
+
+### Text-aware feature selection (with optional DR)
 ```bash
 python scripts/feature_selection.py
+python scripts/feature_selection.py --config configs/advanced_experiment.yaml
 ```
 
 ### Expanded tabular benchmark
@@ -250,4 +297,6 @@ python evaluation/plots/generate_plots.py
 ## Notes
 - the main clinical task remains `PD` versus `AP`
 - model ranking emphasizes `balanced_accuracy`, `AP recall`, and `AUC-ROC` instead of raw accuracy alone
-- the repository is experimental, but the codebase is now organized around reusable preprocessing, modeling, and evaluation components
+- DR is opt-in via the YAML config; all original behaviour is preserved when `dimensionality_reduction: null`
+- the Hellinger selector is the most important single method for this dataset given the 6% AP class frequency
+- LLM/MRL embedding reducers require `pip install sentence-transformers` and network access on first run

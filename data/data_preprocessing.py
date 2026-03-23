@@ -1,9 +1,25 @@
+"""
+data_preprocessing.py
+======================
+Core preprocessing utilities for the C-OPN Parkinson classification pipeline.
+
+Key additions over the original version
+-----------------------------------------
+• ``prepare_modeling_dataset`` now accepts an optional ``dr_config`` parameter.
+  When supplied, the function calls :func:`apply_dr_to_prepared_dataset` from
+  ``dimensionality_reduction.py`` and returns the reduced feature matrix as
+  part of :class:`PreparedDataset`.
+• ``PreparedDataset`` carries two new optional fields:
+  ``dr_pipeline``  – the fitted :class:`DRPipeline` (or ``None``).
+  ``dr_applied``   – bool flag.
+"""
+
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 import pandas as pd
 
@@ -247,14 +263,45 @@ LEAKAGE_PATTERNS = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Data container
+# ---------------------------------------------------------------------------
+
 @dataclass
 class PreparedDataset:
+    """Modeling-ready dataset returned by :func:`prepare_modeling_dataset`.
+
+    Attributes
+    ----------
+    X : pd.DataFrame
+        Feature matrix (may be DR-reduced or raw).
+    y : pd.Series
+        Target vector aligned with X.
+    master : pd.DataFrame
+        Full merged table including target metadata columns.
+    target_name : str
+        Name of the target column used (``"target_binary"`` or
+        ``"target_multiclass"``).
+    feature_summary : pd.DataFrame
+        Per-feature dtype / missingness summary *before* DR.
+    dr_pipeline : DRPipeline or None
+        Fitted dimensionality-reduction pipeline (if DR was applied).
+    dr_applied : bool
+        True when DR was applied and X is the reduced representation.
+    """
+
     X: pd.DataFrame
     y: pd.Series
     master: pd.DataFrame
     target_name: str
     feature_summary: pd.DataFrame
+    dr_pipeline: Any = field(default=None)   # DRPipeline | None
+    dr_applied: bool = False
 
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
 def _read_csv(path: Path, **kwargs) -> pd.DataFrame:
     return pd.read_csv(path, low_memory=False, **kwargs)
@@ -370,6 +417,10 @@ def describe_csv_collection(data_dir: Path = DATA_DIR, headers_only: bool = True
     return pd.DataFrame(summaries).sort_values("filename").reset_index(drop=True)
 
 
+# ---------------------------------------------------------------------------
+# Target metadata
+# ---------------------------------------------------------------------------
+
 def load_target_metadata(data_dir: Path = DATA_DIR) -> pd.DataFrame:
     enrollment = _read_csv(data_dir / "enrollement.csv")
     clinical = _read_csv(data_dir / "clinical.csv")
@@ -402,6 +453,10 @@ def load_target_metadata(data_dir: Path = DATA_DIR) -> pd.DataFrame:
 
     return target_df.merge(clinical_subset, on="project_key", how="left")
 
+
+# ---------------------------------------------------------------------------
+# Feature loading
+# ---------------------------------------------------------------------------
 
 def load_feature_tables(
     data_dir: Path = DATA_DIR,
@@ -436,6 +491,10 @@ def load_feature_tables(
     return merged
 
 
+# ---------------------------------------------------------------------------
+# Master dataset
+# ---------------------------------------------------------------------------
+
 def build_master_dataset(
     data_dir: Path = DATA_DIR,
     tables: Sequence[str] | None = None,
@@ -445,6 +504,10 @@ def build_master_dataset(
     features = load_feature_tables(data_dir=data_dir, tables=tables, drop_metadata_columns=drop_metadata_columns)
     return targets.merge(features, on="project_key", how="left")
 
+
+# ---------------------------------------------------------------------------
+# Feature missingness summary
+# ---------------------------------------------------------------------------
 
 def summarize_feature_missingness(master: pd.DataFrame, top_n: int = 25) -> pd.DataFrame:
     excluded = {
@@ -471,13 +534,52 @@ def summarize_feature_missingness(master: pd.DataFrame, top_n: int = 25) -> pd.D
     return missingness.sort_values(["missing_pct", "feature"], ascending=[False, True]).head(top_n).reset_index(drop=True)
 
 
+# ---------------------------------------------------------------------------
+# Main entry-point: prepare_modeling_dataset
+# ---------------------------------------------------------------------------
+
 def prepare_modeling_dataset(
     target: str = "binary",
     data_dir: Path = DATA_DIR,
     tables: Sequence[str] | None = None,
     missingness_threshold: float = 0.65,
     drop_metadata_columns: bool = True,
+    dr_config: dict[str, Any] | None = None,
 ) -> PreparedDataset:
+    """Build a modeling-ready dataset with optional dimensionality reduction.
+
+    Parameters
+    ----------
+    target : {"binary", "multiclass"}
+        Which label to use as y.
+    data_dir : Path
+        Root directory containing C-OPN CSV files.
+    tables : list of str or None
+        CSV filenames to include.  Defaults to ``DEFAULT_FEATURE_TABLES``.
+    missingness_threshold : float
+        Drop features where the fraction of missing values exceeds this.
+    drop_metadata_columns : bool
+        Strip administrative / metadata columns before merging.
+    dr_config : dict or None
+        Optional dimensionality-reduction config.  Format::
+
+            {
+                "mode": "sequential",          # or "parallel"
+                "keep_original_numeric": False,
+                "methods": [
+                    {"type": "famd", "n_components": 50},
+                    {"type": "hellinger", "n_features": 100}
+                ]
+            }
+
+        Pass ``None`` (default) to skip DR entirely.
+
+    Returns
+    -------
+    PreparedDataset
+        Contains X, y, master, target_name, feature_summary, dr_pipeline,
+        and dr_applied.
+    """
     master = build_master_dataset(data_dir=data_dir, tables=tables, drop_metadata_columns=drop_metadata_columns)
 
     if target == "binary":
@@ -519,8 +621,38 @@ def prepare_modeling_dataset(
         }
     ).sort_values(["missing_pct", "feature"]).reset_index(drop=True)
 
-    return PreparedDataset(X=X, y=y, master=master, target_name=target_name, feature_summary=feature_summary)
+    # ---- Optional DR ---------------------------------------------------
+    dr_pipeline = None
+    dr_applied = False
 
+    if dr_config:
+        try:
+            from dimensionality_reduction import apply_dr_to_prepared_dataset
+            X, dr_pipeline = apply_dr_to_prepared_dataset(X, y, dr_config)
+            dr_applied = True
+        except ImportError:
+            import warnings
+            warnings.warn(
+                "dimensionality_reduction.py not found on the Python path. "
+                "DR will be skipped. Ensure the file is importable.",
+                ImportWarning,
+                stacklevel=2,
+            )
+
+    return PreparedDataset(
+        X=X,
+        y=y,
+        master=master,
+        target_name=target_name,
+        feature_summary=feature_summary,
+        dr_pipeline=dr_pipeline,
+        dr_applied=dr_applied,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Convenience helpers (unchanged from original)
+# ---------------------------------------------------------------------------
 
 def select_level_1_or_2_tables(catalog: pd.DataFrame | None = None) -> list[str]:
     catalog = repository_table_catalog() if catalog is None else catalog

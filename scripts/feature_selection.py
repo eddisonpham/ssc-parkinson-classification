@@ -36,6 +36,12 @@ class FeatureSelectionResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run text-aware feature selection for C-OPN.")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=REPO_ROOT / "configs" / "default_experiment.yaml",
+        help="Path to YAML experiment config (for dimensionality_reduction key).",
+    )
     parser.add_argument("--target", choices=["binary", "multiclass"], default="binary")
     parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "results")
     parser.add_argument("--missingness-threshold", type=float, default=0.65)
@@ -45,7 +51,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-df", type=int, default=5)
     parser.add_argument("--selector-c", type=float, default=0.5)
     parser.add_argument("--top-k-fallback", type=int, default=200)
+    parser.add_argument(
+        "--no-dr",
+        action="store_true",
+        help="Disable dimensionality reduction even if specified in the config.",
+    )
     return parser.parse_args()
+
+
+def _load_config(path: Path) -> dict[str, Any]:
+    """Load YAML experiment config, returning empty dict if the file is absent."""
+    if not path.exists():
+        return {}
+    import yaml  # lazy import; yaml is already a dependency of other scripts
+    with path.open("r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle) or {}
 
 
 def _tokenize_value(value: object) -> str:
@@ -316,9 +336,14 @@ def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Load experiment config for dimensionality_reduction key.
+    config = _load_config(args.config)
+    dr_config = None if args.no_dr else config.get("dimensionality_reduction")
+
     prepared = prepare_modeling_dataset(
         target=args.target,
         missingness_threshold=args.missingness_threshold,
+        dr_config=dr_config,
     )
     result = run_feature_selection_experiment(
         prepared=prepared,

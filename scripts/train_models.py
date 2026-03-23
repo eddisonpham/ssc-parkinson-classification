@@ -42,6 +42,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--missingness-threshold", type=float, default=None)
     parser.add_argument("--test-size", type=float, default=None)
     parser.add_argument("--random-seed", type=int, default=None)
+    parser.add_argument(
+        "--no-dr",
+        action="store_true",
+        help="Disable dimensionality reduction even if specified in the config.",
+    )
     return parser.parse_args()
 
 
@@ -350,6 +355,8 @@ def main() -> None:
     test_size = args.test_size if args.test_size is not None else config.get("test_size", 0.2)
     random_seed = args.random_seed if args.random_seed is not None else config.get("random_seed", 42)
     tables = config.get("tables", DEFAULT_FEATURE_TABLES)
+    # Dimensionality reduction: read from config; --no-dr flag overrides to None.
+    dr_config = None if args.no_dr else config.get("dimensionality_reduction")
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -357,6 +364,7 @@ def main() -> None:
         target=target,
         tables=tables,
         missingness_threshold=missingness_threshold,
+        dr_config=dr_config,
     )
 
     X_train, X_test, y_train, y_test, split_info = split_dataset(
@@ -406,6 +414,8 @@ def main() -> None:
         "sample_count": int(prepared.X.shape[0]),
         "class_distribution": {str(key): int(value) for key, value in prepared.y.value_counts().to_dict().items()},
         "split": split_info,
+        "dr_applied": prepared.dr_applied,
+        "dr_config": dr_config,
     }
     with (output_dir / "experiment_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(experiment_summary, handle, indent=2)
@@ -417,6 +427,7 @@ def main() -> None:
         f"- Samples: `{prepared.X.shape[0]}`",
         f"- Features after filtering: `{prepared.X.shape[1]}`",
         f"- Missingness threshold: `{missingness_threshold}`",
+        f"- Dimensionality reduction: `{'enabled' if prepared.dr_applied else 'disabled'}`",
         f"- Split: `{split_info['split_type']}`",
     ]
     if site_holdout:
