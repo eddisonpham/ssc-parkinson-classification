@@ -19,6 +19,8 @@ ssc-case-study-parkinson-classification/
 ├── configs/
 │   ├── default_experiment.yaml       ← updated: DR config blocks
 │   └── advanced_experiment.yaml      ← updated: FAMD+Hellinger as default
+├── notebooks/
+│   └── pipeline_validation.ipynb     ← step-by-step viz: raw CSVs → clinical X → PCA
 ├── data/
 │   ├── __init__.py
 │   ├── data_preprocessing.py         ← updated: dr_config parameter + PreparedDataset fields

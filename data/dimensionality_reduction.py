@@ -1,135 +1,101 @@
 """
 dimensionality_reduction.py
 ============================
-Modular dimensionality-reduction (DR) methods for the C-OPN Parkinson
-classification pipeline.
+Dimensionality reduction registry for the C-OPN clinical feature matrix.
 
-Methods implemented
--------------------
-1.  MCAReducer              – Multiple Correspondence Analysis (categorical-only)
-2.  FAMDReducer             – Factor Analysis of Mixed Data (mixed types)
-3.  CATSCAReducer           – CATPCA approximation via Alternating Least Squares
-4.  HellingerSelector       – sssHD: Hellinger-distance feature selector for
-                              extreme class imbalance
-5.  LLMEmbeddingReducer     – Sentence-encoder + PCA (optional, requires
-                              sentence-transformers)
-6.  MRLEmbeddingReducer     – MRL-truncation variant of LLM encoder (optional)
-7.  TFIDFEmbeddingReducer   – Lightweight TF-IDF + PCA fallback for text columns
-8.  DRPipeline              – Sequential/parallel composition of any reducers
-
-Factory
--------
-build_dr_pipeline(config: dict) -> DRPipeline
-
-Public helpers
---------------
-detect_column_types(X, categorical_threshold)
-    – Returns (numeric_cols, categorical_cols, text_cols) with heuristics
-      matching the C-OPN column profile.
-
-Design notes
+Architecture
 ------------
-•  All reducers follow the sklearn ``fit`` / ``transform`` / ``fit_transform``
-   API and accept + return ``pd.DataFrame`` (not ndarray), preserving column
-   provenance.
-•  Missing values are handled internally; callers need not impute first.
-•  Each reducer is independently configurable for ablation studies.
-•  LLM-based reducers degrade gracefully: if sentence-transformers is absent,
-   they fall back to TFIDFEmbeddingReducer transparently.
+Each reducer is a subclass of BaseReducer and registered via @register_reducer.
+A DRPipeline chains reducers in sequential or parallel mode.
+ClinicalPreprocessor handles imputation + scaling, then delegates to the pipeline.
+
+Registered methods
+------------------
+  "pca"            — StandardScaler → PCA (baseline)
+  "famd"           — Factor Analysis of Mixed Data (numeric + binary/ordinal)
+  "catpca"         — Simplified CATPCA with ALS optimal scaling (ordinal-aware)
+  "hellinger"      — Hellinger distance feature selection (imbalance-aware)
+  "famd_hellinger" — Convenience alias: sequential FAMD → Hellinger (Pipeline A)
+
+Method selection rationale for C-OPN
+--------------------------------------
+After data_preprocessing.py, features are already aggregated scale scores:
+  - Continuous numeric  (UPDRS parts, MoCA total, z-scores, durations)
+  - Binary flags        (administered flags, yes/no clinical features)
+  - Small-range ordinal (Hoehn & Yahr 1-5, Likert-derived totals)
+
+Given this, the recommended method order is:
+
+  1. famd_hellinger (Pipeline A) — FAMD handles the mixed
+     numeric/binary structure; Hellinger then surfaces the AP-discriminative
+     components from a 6% minority class without SMOTE.
+
+  2. famd — Good standalone option; formally correct for mixed types.
+     For this already-encoded feature set, produces results close to PCA
+     but with proper treatment of binary column variance (p*(1-p)).
+
+  3. catpca — Best when ordinal structure matters (Hoehn & Yahr, etc.).
+     Slower due to ALS iterations.
+
+  4. hellinger — Standalone feature *selection* (not transformation).
+     Use when you want a sparse, interpretable subset of original features.
+
+  5. pca — Baseline; included for comparison. Does NOT distinguish
+     numeric from binary columns during scaling.
+
+Methods NOT included (from the design document)
+  - MCA: requires raw multi-category text columns; our features are already
+    encoded to numeric/binary scale scores.
+  - TF-IDF / LLM / MRL: require raw questionnaire text, not applicable at
+    this (post-extraction) stage.
+
+Outputs per run
+---------------
+  results/{method}/
+    train_preprocessed.csv   ← imputed + scaled, BEFORE DR (labels included)
+    test_preprocessed.csv
+    train_{method}.csv       ← after DR transformation (labels included)
+    test_{method}.csv
+
+Critical design rule
+---------------------
+ALL reducers are fit on the training set only, then applied to both splits.
 """
 
 from __future__ import annotations
 
-import logging
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
-from scipy.spatial.distance import cdist
 from sklearn.decomposition import PCA, TruncatedSVD
-from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import (
-    OrdinalEncoder,
-    StandardScaler,
-    OneHotEncoder,
-)
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.svm import LinearSVC
 
-logger = logging.getLogger(__name__)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # ---------------------------------------------------------------------------
-# Constants
+# Registry
 # ---------------------------------------------------------------------------
 
-_DEFAULT_CATEGORICAL_THRESHOLD = 20   # nunique ≤ N → categorical
-_DEFAULT_TEXT_MIN_LENGTH = 15          # mean len > N → text column
-_DEFAULT_N_COMPONENTS = 50
-_DEFAULT_N_BINS = 10
+_REDUCER_REGISTRY: dict[str, type["BaseReducer"]] = {}
 
 
-# ---------------------------------------------------------------------------
-# Column-type detection
-# ---------------------------------------------------------------------------
+def register_reducer(name: str):
+    """Class decorator that adds the reducer to the global registry."""
+    def decorator(cls: type) -> type:
+        _REDUCER_REGISTRY[name] = cls
+        return cls
+    return decorator
 
-def detect_column_types(
-    X: pd.DataFrame,
-    categorical_threshold: int = _DEFAULT_CATEGORICAL_THRESHOLD,
-    text_min_mean_length: float = _DEFAULT_TEXT_MIN_LENGTH,
-) -> tuple[list[str], list[str], list[str]]:
-    """Heuristically split columns into numeric, categorical, and text groups.
 
-    Rules (applied in priority order)
-    ----------------------------------
-    1. Numeric dtype AND nunique > threshold  → numeric
-    2. Object dtype AND mean string length > text_min_mean_length → text
-    3. Object dtype OR nunique ≤ threshold    → categorical
-
-    Parameters
-    ----------
-    X : pd.DataFrame
-        Feature matrix (no target column).
-    categorical_threshold : int
-        Maximum number of unique values for a column to be treated as
-        categorical rather than numeric.
-    text_min_mean_length : float
-        Minimum mean character length of non-null values for a string column
-        to be classified as free-text rather than categorical.
-
-    Returns
-    -------
-    (numeric_cols, categorical_cols, text_cols) : tuple of list[str]
-    """
-    numeric_cols: list[str] = []
-    categorical_cols: list[str] = []
-    text_cols: list[str] = []
-
-    for col in X.columns:
-        series = X[col].dropna()
-        if len(series) == 0:
-            categorical_cols.append(col)
-            continue
-
-        is_numeric = pd.api.types.is_numeric_dtype(X[col])
-        n_unique = X[col].nunique(dropna=True)
-
-        if is_numeric and n_unique > categorical_threshold:
-            numeric_cols.append(col)
-        elif not is_numeric:
-            mean_len = series.astype(str).str.len().mean()
-            if mean_len > text_min_mean_length:
-                text_cols.append(col)
-            else:
-                categorical_cols.append(col)
-        else:
-            # numeric but low cardinality → treat as ordinal/categorical
-            categorical_cols.append(col)
-
-    return numeric_cols, categorical_cols, text_cols
+def list_reducers() -> list[str]:
+    return sorted(_REDUCER_REGISTRY.keys())
 
 
 # ---------------------------------------------------------------------------
@@ -137,420 +103,471 @@ def detect_column_types(
 # ---------------------------------------------------------------------------
 
 class BaseReducer(ABC):
-    """Abstract base class for all dimensionality-reduction steps.
-
-    Subclasses must implement ``fit`` and ``transform``.
-    All methods accept and return ``pd.DataFrame``.
+    """
+    All reducers implement fit / transform on pandas DataFrames.
+    y is optional (required for supervised methods like Hellinger).
     """
 
-    name: str = "base"
-
-    def fit_transform(self, X: pd.DataFrame, y: Optional[pd.Series] = None) -> pd.DataFrame:
-        return self.fit(X, y).transform(X)
-
     @abstractmethod
-    def fit(self, X: pd.DataFrame, y: Optional[pd.Series] = None) -> "BaseReducer":
+    def fit(self, X: pd.DataFrame, y: pd.Series | None = None) -> "BaseReducer":
         ...
 
     @abstractmethod
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         ...
 
-    def _output_columns(self, prefix: str, n: int) -> list[str]:
-        return [f"{prefix}__{i:03d}" for i in range(n)]
+    def fit_transform(self, X: pd.DataFrame, y: pd.Series | None = None) -> pd.DataFrame:
+        return self.fit(X, y).transform(X)
+
+    @property
+    def output_dim(self) -> int:
+        raise NotImplementedError
 
 
 # ---------------------------------------------------------------------------
-# 1. MCA – Multiple Correspondence Analysis
+# Column type detection utility
 # ---------------------------------------------------------------------------
 
-class MCAReducer(BaseReducer):
-    """Multiple Correspondence Analysis for purely categorical feature sets.
+def detect_column_types(
+    df: pd.DataFrame,
+    categorical_threshold: int = 10,
+) -> tuple[list[str], list[str]]:
+    """
+    Split columns into numeric and categorical.
 
-    Algorithm
-    ---------
-    1. One-hot encode categorical columns (binary indicator matrix Z).
-    2. Compute the correspondence matrix P = Z / n.
-    3. Subtract expected values (independence model): Z_std = (P - r·c') / sqrt(r·c').
-    4. Apply TruncatedSVD to Z_std.
-    5. Scale principal coordinates by singular values.
+    A column is considered categorical if:
+      - dtype is object or category, OR
+      - number of unique non-null values <= categorical_threshold
 
-    This reproduces the chi-squared geometry described in Paper [1].
+    Returns (numeric_cols, categorical_cols).
+    """
+    numeric, categorical = [], []
+    for col in df.columns:
+        if df[col].dtype.kind in ("O", "U") or str(df[col].dtype) == "category":
+            categorical.append(col)
+        elif df[col].nunique(dropna=True) <= categorical_threshold:
+            categorical.append(col)
+        else:
+            numeric.append(col)
+    return numeric, categorical
+
+
+# ---------------------------------------------------------------------------
+# 1. PCA Reducer (baseline)
+# ---------------------------------------------------------------------------
+
+@register_reducer("pca")
+class PCAReducer(BaseReducer):
+    """
+    StandardScaler → PCA with automatic n_components selection.
 
     Parameters
     ----------
-    n_components : int
-        Number of MCA dimensions to retain.
-    categorical_threshold : int
-        Columns with ``nunique ≤ categorical_threshold`` are treated as
-        categorical regardless of dtype.
+    variance_target : float
+        Fraction of variance to retain (default 0.85).
+    n_components : int | None
+        Fixed component count; overrides variance_target if set.
+    max_components : int
+        Hard ceiling on components.
     """
-
-    name = "mca"
 
     def __init__(
         self,
-        n_components: int = _DEFAULT_N_COMPONENTS,
-        categorical_threshold: int = _DEFAULT_CATEGORICAL_THRESHOLD,
-    ) -> None:
+        variance_target: float = 0.85,
+        n_components: int | None = None,
+        max_components: int = 50,
+    ):
+        self.variance_target = variance_target
         self.n_components = n_components
-        self.categorical_threshold = categorical_threshold
-        self._encoder: OneHotEncoder | None = None
-        self._imputer: SimpleImputer | None = None
-        self._svd: TruncatedSVD | None = None
-        self._cat_cols: list[str] = []
-        self._col_masses: np.ndarray | None = None
+        self.max_components = max_components
+        self._scaler: StandardScaler | None = None
+        self._pca: PCA | None = None
+        self._n_out: int = 0
 
-    def fit(self, X: pd.DataFrame, y: Optional[pd.Series] = None) -> "MCAReducer":
-        _, cat_cols, _ = detect_column_types(X, self.categorical_threshold)
-        self._cat_cols = cat_cols or list(X.columns)
+    def fit(self, X: pd.DataFrame, y: pd.Series | None = None) -> "PCAReducer":
+        self._scaler = StandardScaler()
+        X_scaled = self._scaler.fit_transform(X)
 
-        Xcat = X[self._cat_cols].astype(str)
-        self._imputer = SimpleImputer(strategy="most_frequent")
-        Xcat_imp = pd.DataFrame(
-            self._imputer.fit_transform(Xcat),
-            columns=self._cat_cols,
-            index=X.index,
-        )
+        if self.n_components is not None:
+            n = min(self.n_components, self.max_components, X_scaled.shape[1])
+        else:
+            pca_full = PCA(random_state=42).fit(X_scaled)
+            cumvar = np.cumsum(pca_full.explained_variance_ratio_)
+            n = int(np.searchsorted(cumvar, self.variance_target) + 1)
+            n = min(n, self.max_components, X_scaled.shape[1])
 
-        self._encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=True)
-        Z = self._encoder.fit_transform(Xcat_imp)
-
-        Z_dense = np.asarray(Z.todense(), dtype=float)
-        n = Z_dense.shape[0]
-
-        P = Z_dense / n
-        row_masses = P.sum(axis=1, keepdims=True)          # shape (n, 1)
-        col_masses = P.sum(axis=0, keepdims=True)          # shape (1, p)
-        self._col_masses = col_masses.ravel()
-
-        # Standardised residuals (chi-square metric)
-        expected = row_masses @ col_masses
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            Z_std = (P - expected) / np.sqrt(np.maximum(expected, 1e-10))
-
-        n_comp = min(self.n_components, min(Z_std.shape) - 1)
-        self._svd = TruncatedSVD(n_components=n_comp, random_state=42)
-        self._svd.fit(Z_std)
+        self._pca = PCA(n_components=n, random_state=42).fit(X_scaled)
+        self._n_out = n
+        evr = self._pca.explained_variance_ratio_.sum()
+        print(f"  [PCA] {n} components → {evr*100:.1f}% variance")
         return self
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        Xcat = X[self._cat_cols].astype(str)
-        Xcat_imp = pd.DataFrame(
-            self._imputer.transform(Xcat),
-            columns=self._cat_cols,
-            index=X.index,
-        )
-        Z = self._encoder.transform(Xcat_imp)
-        Z_dense = np.asarray(Z.todense(), dtype=float)
-        n = Z_dense.shape[0]
+        Xs = self._scaler.transform(X)
+        out = self._pca.transform(Xs)
+        cols = [f"pc_{i+1:02d}" for i in range(self._n_out)]
+        return pd.DataFrame(out, index=X.index, columns=cols)
 
-        P = Z_dense / n
-        row_masses = P.sum(axis=1, keepdims=True)
-        col_masses = self._col_masses[np.newaxis, :]
-        expected = row_masses @ col_masses
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            Z_std = (P - expected) / np.sqrt(np.maximum(expected, 1e-10))
+    @property
+    def output_dim(self) -> int:
+        return self._n_out
 
-        coords = self._svd.transform(Z_std)
-        cols = self._output_columns("mca", coords.shape[1])
-        return pd.DataFrame(coords, columns=cols, index=X.index)
+    @property
+    def explained_variance_ratio(self) -> np.ndarray:
+        return self._pca.explained_variance_ratio_ if self._pca else np.array([])
 
 
 # ---------------------------------------------------------------------------
-# 2. FAMD – Factor Analysis of Mixed Data
+# 2. FAMD Reducer
 # ---------------------------------------------------------------------------
 
+@register_reducer("famd")
 class FAMDReducer(BaseReducer):
-    """Factor Analysis of Mixed Data (categorical + numeric).
+    """
+    Factor Analysis of Mixed Data (Pagès 2004).
 
-    Implements the method described in Papers [1, 2].
+    Handles C-OPN's mix of continuous scores (UPDRS, z-scores, durations)
+    and binary flags (administered flags, yes/no clinical features).
 
     Algorithm
     ---------
-    Numeric block  : standardise (mean 0, std 1) after median imputation.
-    Categorical block : apply the MCA indicator encoding (frequency-scaled
-                        one-hot), giving columns the same chi-square geometry
-                        as in MCA.
-    Joint SVD       : concatenate both blocks and run TruncatedSVD.
+    1. Detect numeric vs categorical columns.
+    2. Numeric block  : standardise (z-score).
+    3. Categorical block : one-hot encode; scale each dummy column j by
+       1 / sqrt(p_j) where p_j = proportion of 1s in training data.
+       Then weight the whole block by 1 / sqrt(n_cat) so numeric and
+       categorical blocks contribute equally to the SVD.
+    4. Concatenate blocks → TruncatedSVD.
+    5. Output: row projections (coordinates in FAMD space).
+
+    This is equivalent to PCA on binary columns (their std = sqrt(p*(1-p))),
+    but differs for numeric columns: categorical structure is preserved
+    rather than flattened into a single scale.
 
     Parameters
     ----------
     n_components : int
         Number of FAMD dimensions to retain.
+    variance_target : float
+        Used when n_components is None to auto-select n_components.
+    max_components : int
+        Hard ceiling.
     categorical_threshold : int
-        Columns with ``nunique ≤ categorical_threshold`` are treated as
-        categorical regardless of dtype.
+        Columns with nunique <= threshold are treated as categorical.
     """
-
-    name = "famd"
 
     def __init__(
         self,
-        n_components: int = _DEFAULT_N_COMPONENTS,
-        categorical_threshold: int = _DEFAULT_CATEGORICAL_THRESHOLD,
-    ) -> None:
+        n_components: int | None = None,
+        variance_target: float = 0.85,
+        max_components: int = 50,
+        categorical_threshold: int = 10,
+    ):
         self.n_components = n_components
+        self.variance_target = variance_target
+        self.max_components = max_components
         self.categorical_threshold = categorical_threshold
 
         self._num_cols: list[str] = []
         self._cat_cols: list[str] = []
-        self._num_imputer: SimpleImputer | None = None
         self._num_scaler: StandardScaler | None = None
-        self._cat_imputer: SimpleImputer | None = None
-        self._cat_encoder: OneHotEncoder | None = None
+        self._ohe: OneHotEncoder | None = None
+        self._cat_scale_: np.ndarray | None = None  # 1/sqrt(p_j) per dummy
+        self._cat_weight: float = 1.0               # 1/sqrt(n_cat)
         self._svd: TruncatedSVD | None = None
-        self._cat_col_freq: np.ndarray | None = None  # MCA frequency scaling
+        self._n_out: int = 0
 
-    def fit(self, X: pd.DataFrame, y: Optional[pd.Series] = None) -> "FAMDReducer":
-        num_cols, cat_cols, _ = detect_column_types(X, self.categorical_threshold)
-        self._num_cols = num_cols
-        self._cat_cols = cat_cols
+    def _build_matrix(self, X: pd.DataFrame, fit: bool = False) -> np.ndarray:
+        """Construct the scaled FAMD matrix from X."""
+        blocks = []
 
-        blocks: list[np.ndarray] = []
-
-        # ---- numeric block ----
+        # Numeric block
         if self._num_cols:
-            self._num_imputer = SimpleImputer(strategy="median")
-            self._num_scaler = StandardScaler()
-            Xnum = self._num_imputer.fit_transform(X[self._num_cols])
-            Xnum_sc = self._num_scaler.fit_transform(Xnum)
-            blocks.append(Xnum_sc)
+            num_data = X[self._num_cols].to_numpy(dtype=float)
+            if fit:
+                self._num_scaler = StandardScaler()
+                num_scaled = self._num_scaler.fit_transform(num_data)
+            else:
+                num_scaled = self._num_scaler.transform(num_data)
+            blocks.append(num_scaled)
 
-        # ---- categorical block (MCA-style frequency scaling) ----
+        # Categorical block
         if self._cat_cols:
-            Xcat = X[self._cat_cols].astype(str)
-            self._cat_imputer = SimpleImputer(strategy="most_frequent")
-            Xcat_imp = self._cat_imputer.fit_transform(Xcat)
-            self._cat_encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
-            Z = self._cat_encoder.fit_transform(Xcat_imp)
-            # Frequency scaling: divide by sqrt(col frequency)
-            freq = Z.mean(axis=0)
-            freq = np.where(freq < 1e-8, 1e-8, freq)
-            self._cat_col_freq = freq
-            Z_scaled = Z / np.sqrt(freq)
-            blocks.append(Z_scaled)
+            cat_data = X[self._cat_cols]
+            if fit:
+                self._ohe = OneHotEncoder(
+                    sparse_output=False,
+                    handle_unknown="ignore",
+                    drop=None,
+                )
+                dummies = self._ohe.fit_transform(cat_data)
+                # Compute column-wise proportions on training data
+                # Add small epsilon to avoid division by zero
+                p = dummies.mean(axis=0).clip(1e-6, 1 - 1e-6)
+                self._cat_scale_ = 1.0 / np.sqrt(p)
+                self._cat_weight = 1.0 / np.sqrt(max(len(self._cat_cols), 1))
+            else:
+                dummies = self._ohe.transform(cat_data)
 
-        joint = np.hstack(blocks)
-        n_comp = min(self.n_components, min(joint.shape) - 1)
-        self._svd = TruncatedSVD(n_components=n_comp, random_state=42)
-        self._svd.fit(joint)
+            cat_scaled = dummies * self._cat_scale_ * self._cat_weight
+            blocks.append(cat_scaled)
+
+        if not blocks:
+            raise ValueError("No columns to process in FAMDReducer.")
+
+        return np.hstack(blocks)
+
+    def fit(self, X: pd.DataFrame, y: pd.Series | None = None) -> "FAMDReducer":
+        self._num_cols, self._cat_cols = detect_column_types(
+            X, self.categorical_threshold
+        )
+        M = self._build_matrix(X, fit=True)
+
+        # Auto-select n_components using the full SVD
+        if self.n_components is None:
+            max_k = min(M.shape[0] - 1, M.shape[1], self.max_components)
+            svd_full = TruncatedSVD(n_components=max_k, random_state=42).fit(M)
+            total_var = svd_full.explained_variance_ratio_.sum()
+            target = min(self.variance_target, total_var - 1e-6)
+            cumvar = np.cumsum(svd_full.explained_variance_ratio_)
+            n = int(np.searchsorted(cumvar, target) + 1)
+            n = min(n, self.max_components, max_k)
+        else:
+            n = min(self.n_components, self.max_components, M.shape[1])
+
+        self._svd = TruncatedSVD(n_components=n, random_state=42).fit(M)
+        self._n_out = n
+        evr = self._svd.explained_variance_ratio_.sum()
+        print(
+            f"  [FAMD] {len(self._num_cols)} numeric + "
+            f"{len(self._cat_cols)} categorical cols → "
+            f"{n} components ({evr*100:.1f}% variance)"
+        )
         return self
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        blocks: list[np.ndarray] = []
+        M = self._build_matrix(X, fit=False)
+        out = self._svd.transform(M)
+        cols = [f"famd_{i+1:02d}" for i in range(self._n_out)]
+        return pd.DataFrame(out, index=X.index, columns=cols)
 
-        if self._num_cols:
-            Xnum = self._num_imputer.transform(X[self._num_cols])
-            blocks.append(self._num_scaler.transform(Xnum))
-
-        if self._cat_cols:
-            Xcat = X[self._cat_cols].astype(str)
-            Xcat_imp = self._cat_imputer.transform(Xcat)
-            Z = self._cat_encoder.transform(Xcat_imp)
-            Z_scaled = Z / np.sqrt(self._cat_col_freq)
-            blocks.append(Z_scaled)
-
-        joint = np.hstack(blocks)
-        coords = self._svd.transform(joint)
-        cols = self._output_columns("famd", coords.shape[1])
-        return pd.DataFrame(coords, columns=cols, index=X.index)
+    @property
+    def output_dim(self) -> int:
+        return self._n_out
 
 
 # ---------------------------------------------------------------------------
-# 3. CATPCA – Categorical PCA with Optimal Scaling (ALS approximation)
+# 3. CATPCA Reducer (simplified ALS optimal scaling)
 # ---------------------------------------------------------------------------
 
+@register_reducer("catpca")
 class CATSCAReducer(BaseReducer):
-    """Categorical PCA via Alternating Least Squares (CATPCA approximation).
+    """
+    Simplified CATPCA with Alternating Least Squares (ALS) optimal scaling.
 
-    Implements the optimal-scaling concept from Papers [1, 2].
+    Exploits ordinal structure in Likert-scale and stage columns (e.g.
+    Hoehn & Yahr, BAI/BDI item scores) by iteratively finding numerical
+    quantifications that maximise PCA variance while respecting category ordering.
 
-    True CATPCA iterates:
-        1. Quantify category levels to maximise correlation with PCA scores.
-        2. Re-run PCA on quantified matrix.
-    until convergence.  This implementation runs the full ALS loop for
-    ordinal/Likert columns and falls back to numeric PCA for true continuous
-    columns.
+    Algorithm
+    ---------
+    1. Detect ordinal (categorical) vs numeric columns.
+    2. Ordinal-encode categorical columns (integer codes preserve ordering).
+    3. ALS loop (max_iter iterations):
+       a. Standardise current matrix → fit PCA → extract scores Z.
+       b. For each categorical column: update quantification[k] =
+          mean row-score for rows where column == category k.
+       c. Re-substitute quantifications into matrix column.
+       d. Check convergence: max change in quantifications < tol.
+    4. Final PCA on converged quantified matrix.
 
     Parameters
     ----------
-    n_components : int
-        Number of principal components.
+    n_components, variance_target, max_components : same as PCAReducer.
     max_iter : int
-        Maximum ALS iterations for optimal scaling.
+        Maximum ALS iterations (default 50).
     tol : float
-        Convergence tolerance (change in loss between iterations).
+        Convergence threshold on quantification changes (default 1e-4).
     categorical_threshold : int
-        Columns with ``nunique ≤ threshold`` are quantified via ALS.
+        Columns with nunique <= threshold are treated as categorical/ordinal.
     """
-
-    name = "catpca"
 
     def __init__(
         self,
-        n_components: int = _DEFAULT_N_COMPONENTS,
+        n_components: int | None = None,
+        variance_target: float = 0.85,
+        max_components: int = 50,
         max_iter: int = 50,
         tol: float = 1e-4,
-        categorical_threshold: int = _DEFAULT_CATEGORICAL_THRESHOLD,
-    ) -> None:
+        categorical_threshold: int = 10,
+    ):
         self.n_components = n_components
+        self.variance_target = variance_target
+        self.max_components = max_components
         self.max_iter = max_iter
         self.tol = tol
         self.categorical_threshold = categorical_threshold
 
         self._num_cols: list[str] = []
-        self._ord_cols: list[str] = []
-        self._num_imputer: SimpleImputer | None = None
-        self._ord_imputer: SimpleImputer | None = None
-        self._ord_encoder: OrdinalEncoder | None = None
-        self._quantifications: dict[str, np.ndarray] = {}  # col → level→value
+        self._cat_cols: list[str] = []
+        self._cat_quantifications: dict[str, dict[int, float]] = {}
         self._pca: PCA | None = None
         self._scaler: StandardScaler | None = None
+        self._n_out: int = 0
 
-    def fit(self, X: pd.DataFrame, y: Optional[pd.Series] = None) -> "CATSCAReducer":
-        num_cols, cat_cols, _ = detect_column_types(X, self.categorical_threshold)
-        # Treat low-cardinality numerics as ordinal too
-        self._num_cols = num_cols
-        self._ord_cols = cat_cols
+    def _quantify(self, X: pd.DataFrame) -> np.ndarray:
+        """Replace categorical columns with their learned quantifications."""
+        M = X.copy()
+        for col in self._cat_cols:
+            codes = M[col].fillna(-1).astype(int)
+            quant = codes.map(
+                lambda c: self._cat_quantifications[col].get(c, 0.0)  # noqa: B023
+            )
+            M[col] = quant
+        return M.to_numpy(dtype=float)
 
-        # Impute
-        self._num_imputer = SimpleImputer(strategy="median")
-        self._ord_imputer = SimpleImputer(strategy="most_frequent")
-
-        Xnum = (
-            self._num_imputer.fit_transform(X[self._num_cols])
-            if self._num_cols else np.empty((len(X), 0))
+    def fit(self, X: pd.DataFrame, y: pd.Series | None = None) -> "CATSCAReducer":
+        self._num_cols, self._cat_cols = detect_column_types(
+            X, self.categorical_threshold
         )
 
-        # Ordinal-encode categorical
-        if self._ord_cols:
-            Xcat = X[self._ord_cols].astype(str)
-            Xcat_imp = pd.DataFrame(
-                self._ord_imputer.fit_transform(Xcat),
-                columns=self._ord_cols,
-            )
-            self._ord_encoder = OrdinalEncoder()
-            Xord = self._ord_encoder.fit_transform(Xcat_imp)
+        # Initialise quantifications = ordinal integer codes
+        for col in self._cat_cols:
+            unique_vals = sorted(X[col].dropna().unique())
+            self._cat_quantifications[col] = {
+                int(v): float(i) for i, v in enumerate(unique_vals)
+            }
+
+        M = self._quantify(X)
+
+        # ALS iterations
+        for iteration in range(self.max_iter):
+            scaler_tmp = StandardScaler()
+            M_scaled = scaler_tmp.fit_transform(np.nan_to_num(M, nan=0.0))
+
+            max_k = min(M_scaled.shape[0] - 1, M_scaled.shape[1])
+            n_comp_iter = min(max(
+                self.n_components or 20, 10
+            ), max_k)
+            pca_tmp = PCA(n_components=n_comp_iter, random_state=42).fit(M_scaled)
+            Z = pca_tmp.transform(M_scaled)  # (n, n_comp_iter)
+
+            max_change = 0.0
+            col_indices = {col: list(X.columns).index(col) for col in self._cat_cols}
+
+            for col in self._cat_cols:
+                col_idx = col_indices[col]
+                new_quant: dict[int, float] = {}
+                for k, old_val in self._cat_quantifications[col].items():
+                    mask = X[col].fillna(-1).astype(int) == k
+                    if mask.sum() == 0:
+                        new_quant[k] = old_val
+                    else:
+                        # Use first PC score as the quantification target
+                        new_val = float(Z[mask, 0].mean())
+                        new_quant[k] = new_val
+                        max_change = max(max_change, abs(new_val - old_val))
+                self._cat_quantifications[col] = new_quant
+
+            # Re-build M with updated quantifications
+            M = self._quantify(X)
+
+            if max_change < self.tol and iteration > 2:
+                print(f"  [CATPCA] ALS converged at iteration {iteration + 1}")
+                break
         else:
-            Xord = np.empty((len(X), 0))
+            print(f"  [CATPCA] ALS reached max_iter={self.max_iter}")
 
-        # ALS optimal scaling on ordinal block
-        Xquant = self._als_quantify(Xord, self._ord_cols)
-
-        joint = np.hstack([Xnum, Xquant])
+        # Final PCA on converged quantified matrix
         self._scaler = StandardScaler()
-        joint_sc = self._scaler.fit_transform(joint)
+        M_final = self._scaler.fit_transform(np.nan_to_num(M, nan=0.0))
 
-        n_comp = min(self.n_components, min(joint_sc.shape))
-        self._pca = PCA(n_components=n_comp, random_state=42)
-        self._pca.fit(joint_sc)
+        if self.n_components is None:
+            max_k = min(M_final.shape[0] - 1, M_final.shape[1], self.max_components)
+            pca_full = PCA(random_state=42).fit(M_final)
+            cumvar = np.cumsum(pca_full.explained_variance_ratio_)
+            n = int(np.searchsorted(cumvar, self.variance_target) + 1)
+            n = min(n, self.max_components, max_k)
+        else:
+            n = min(self.n_components, self.max_components, M_final.shape[1])
+
+        self._pca = PCA(n_components=n, random_state=42).fit(M_final)
+        self._n_out = n
+        evr = self._pca.explained_variance_ratio_.sum()
+        print(
+            f"  [CATPCA] {n} components → {evr*100:.1f}% variance "
+            f"({len(self._cat_cols)} ordinal cols quantified)"
+        )
         return self
 
-    def _als_quantify(self, Xord: np.ndarray, cols: list[str]) -> np.ndarray:
-        """Iteratively find numeric quantifications for each ordinal column."""
-        if Xord.shape[1] == 0:
-            return Xord
-        Xquant = Xord.copy().astype(float)
-        n, p = Xquant.shape
-        prev_loss = np.inf
-
-        for iteration in range(self.max_iter):
-            # Step 1: PCA on current quantified matrix
-            scaler_tmp = StandardScaler()
-            Xsc = scaler_tmp.fit_transform(Xquant)
-            n_comp_tmp = min(self.n_components, min(Xsc.shape))
-            pca_tmp = PCA(n_components=n_comp_tmp)
-            scores = pca_tmp.fit_transform(Xsc)  # (n, k)
-
-            # Step 2: Update quantifications per column via LS regression
-            for j in range(p):
-                levels = np.unique(Xord[:, j])
-                for lv in levels:
-                    mask = Xord[:, j] == lv
-                    if mask.sum() == 0:
-                        continue
-                    # Optimal quantification = mean of PCA scores for that level
-                    Xquant[mask, j] = scores[mask].mean()
-
-            # Convergence check
-            loss = np.mean((Xquant - Xord) ** 2)
-            if abs(prev_loss - loss) < self.tol:
-                logger.debug(f"CATPCA ALS converged in {iteration + 1} iterations.")
-                break
-            prev_loss = loss
-
-        return Xquant
-
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        Xnum = (
-            self._num_imputer.transform(X[self._num_cols])
-            if self._num_cols else np.empty((len(X), 0))
-        )
-        if self._ord_cols:
-            Xcat = X[self._ord_cols].astype(str)
-            Xcat_imp = pd.DataFrame(
-                self._ord_imputer.transform(Xcat),
-                columns=self._ord_cols,
-            )
-            Xord = self._ord_encoder.transform(Xcat_imp)
-        else:
-            Xord = np.empty((len(X), 0))
+        M = self._quantify(X)
+        M_scaled = self._scaler.transform(np.nan_to_num(M, nan=0.0))
+        out = self._pca.transform(M_scaled)
+        cols = [f"catpca_{i+1:02d}" for i in range(self._n_out)]
+        return pd.DataFrame(out, index=X.index, columns=cols)
 
-        Xquant = self._als_quantify(Xord, self._ord_cols)
-        joint = np.hstack([Xnum, Xquant])
-        joint_sc = self._scaler.transform(joint)
-        coords = self._pca.transform(joint_sc)
-        cols = self._output_columns("catpca", coords.shape[1])
-        return pd.DataFrame(coords, columns=cols, index=X.index)
+    @property
+    def output_dim(self) -> int:
+        return self._n_out
 
 
 # ---------------------------------------------------------------------------
-# 4. HellingerSelector – sssHD (Paper [3])
+# 4. Hellinger Feature Selector
 # ---------------------------------------------------------------------------
 
+@register_reducer("hellinger")
 class HellingerSelector(BaseReducer):
-    """Hellinger-distance stable sparse feature selector (sssHD).
+    """
+    Hellinger distance feature selection (sssHD, Fu et al. 2020).
 
-    Addresses extreme class imbalance (AP vs PD: ~6% minority) by using
-    Hellinger distance — a class-insensitive divergence measure — to rank
-    features, then optionally refines selection with a sparse L1-SVM.
+    Addresses the 6% AP minority class. Hellinger distance between class-
+    conditional distributions is insensitive to class imbalance ratio —
+    its value does not change as the ratio shifts from 1:1 to 99:1.
 
-    This reproduces the key theoretical property of Paper [3]:
-    ``H(p, q)`` is invariant to changes in the class-imbalance ratio.
+    Unlike chi-squared or Fisher's criterion, sssHD achieves the best
+    performance with the *fewest* features without requiring SMOTE.
+
+    Algorithm
+    ---------
+    1. For each feature:
+       - Continuous: bin into n_bins buckets (training quantiles).
+       - Binary/categorical: use category frequencies directly.
+       - Compute class-conditional histograms p_PD and p_AP.
+       - Score = H(p_PD, p_AP) = (1/√2) * ||√p - √q||₂
+    2. Rank all features by H score descending.
+    3. Optional L1-SVM refinement: pass top svm_top_k features through
+       a LinearSVC(penalty='l1') for joint sparse selection.
+    4. Return top n_features original columns (NOT a linear transformation).
+
+    Note: output is a *column subset* of the input, not new components.
+    Feature names are preserved for interpretability.
 
     Parameters
     ----------
-    n_features : int or None
-        Hard cap on features retained.  If ``None``, uses the L1-SVM
-        to determine sparsity automatically.
+    n_features : int
+        Number of features to retain (default 60).
     n_bins : int
-        Number of histogram bins for continuous feature discretisation.
+        Histogram bins for continuous features (default 10).
     use_svm_refinement : bool
-        If True, re-rank with a L1 LinearSVC on the top ``svm_top_k``
-        Hellinger-ranked features, mimicking the sssHD pipeline.
+        Apply L1-SVM as a second selection stage (default True).
     svm_top_k : int
-        Number of Hellinger-ranked features passed to the L1-SVM.
+        Features passed to L1-SVM (default 150).
     svm_c : float
-        Regularisation strength for the L1 LinearSVC.
+        Regularisation for L1-SVM (default 0.1).
     categorical_threshold : int
-        Columns with ``nunique ≤ threshold`` are treated as categorical
-        and discretised directly rather than binned.
+        nunique threshold for categorical treatment.
     """
-
-    name = "hellinger"
 
     def __init__(
         self,
-        n_features: int = 100,
-        n_bins: int = _DEFAULT_N_BINS,
+        n_features: int = 60,
+        n_bins: int = 10,
         use_svm_refinement: bool = True,
-        svm_top_k: int = 300,
-        svm_c: float = 0.5,
-        categorical_threshold: int = _DEFAULT_CATEGORICAL_THRESHOLD,
-    ) -> None:
+        svm_top_k: int = 150,
+        svm_c: float = 0.1,
+        categorical_threshold: int = 10,
+    ):
         self.n_features = n_features
         self.n_bins = n_bins
         self.use_svm_refinement = use_svm_refinement
@@ -559,612 +576,451 @@ class HellingerSelector(BaseReducer):
         self.categorical_threshold = categorical_threshold
 
         self._selected_cols: list[str] = []
-        self._imputer: SimpleImputer | None = None
-        self._encoder: OneHotEncoder | None = None
-        self._cat_cols: list[str] = []
-        self._num_cols: list[str] = []
-        self._hellinger_scores: pd.Series | None = None
-
-    # ---- Hellinger distance helpers ----------------------------------------
-
-    @staticmethod
-    def _safe_normalize(arr: np.ndarray) -> np.ndarray:
-        total = arr.sum()
-        return arr / total if total > 0 else arr
+        self._h_scores: pd.Series | None = None
 
     @staticmethod
     def _hellinger(p: np.ndarray, q: np.ndarray) -> float:
-        """Hellinger distance between two probability vectors."""
-        p = HellingerSelector._safe_normalize(p.astype(float))
-        q = HellingerSelector._safe_normalize(q.astype(float))
-        return float((1 / np.sqrt(2)) * np.sqrt(np.sum((np.sqrt(p) - np.sqrt(q)) ** 2)))
+        """Hellinger distance between two discrete distributions."""
+        p = p / (p.sum() + 1e-12)
+        q = q / (q.sum() + 1e-12)
+        return float((1.0 / np.sqrt(2.0)) * np.sqrt(np.sum((np.sqrt(p) - np.sqrt(q)) ** 2)))
 
-    def _score_column(
+    def _feature_score(
         self,
-        values: np.ndarray,
-        y: np.ndarray,
+        col: pd.Series,
+        y: pd.Series,
         is_categorical: bool,
+        bins: np.ndarray | None,
     ) -> float:
-        """Compute Hellinger distance between class-conditional distributions."""
-        classes = np.unique(y)
-        if len(classes) < 2:
+        mask_pd = y == 0
+        mask_ap = y == 1
+        col_pd = col[mask_pd].dropna()
+        col_ap = col[mask_ap].dropna()
+
+        if len(col_pd) == 0 or len(col_ap) == 0:
             return 0.0
 
         if is_categorical:
-            levels = np.unique(values)
-            p0 = np.array([np.sum((values == lv) & (y == classes[0])) for lv in levels], dtype=float)
-            p1 = np.array([np.sum((values == lv) & (y == classes[1])) for lv in levels], dtype=float)
+            cats = np.union1d(col_pd.unique(), col_ap.unique())
+            p_pd = np.array([(col_pd == c).sum() for c in cats], dtype=float)
+            p_ap = np.array([(col_ap == c).sum() for c in cats], dtype=float)
         else:
-            bins = np.histogram_bin_edges(values, bins=self.n_bins)
-            p0 = np.histogram(values[y == classes[0]], bins=bins)[0].astype(float)
-            p1 = np.histogram(values[y == classes[1]], bins=bins)[0].astype(float)
+            p_pd = np.histogram(col_pd, bins=bins)[0].astype(float)
+            p_ap = np.histogram(col_ap, bins=bins)[0].astype(float)
 
-        return self._hellinger(p0, p1)
+        return self._hellinger(p_pd, p_ap)
 
-    # ---- Fit / transform ---------------------------------------------------
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "HellingerSelector":
+        num_cols, cat_cols = detect_column_types(X, self.categorical_threshold)
+        cat_set = set(cat_cols)
 
-    def fit(self, X: pd.DataFrame, y: Optional[pd.Series] = None) -> "HellingerSelector":
-        if y is None:
-            raise ValueError("HellingerSelector requires a target vector y.")
+        # Pre-compute histogram bins per continuous column from training data
+        bins_map: dict[str, np.ndarray] = {}
+        for col in num_cols:
+            vals = X[col].dropna()
+            if len(vals) >= self.n_bins:
+                _, edges = np.histogram(vals, bins=self.n_bins)
+                bins_map[col] = edges
+            else:
+                bins_map[col] = np.linspace(vals.min(), vals.max() + 1e-9, 3)
 
-        num_cols, cat_cols, text_cols = detect_column_types(X, self.categorical_threshold)
-        self._num_cols = num_cols
-        self._cat_cols = cat_cols + text_cols  # treat text as categorical here
-
-        # Impute
-        self._imputer = SimpleImputer(strategy="median")
-        Xnum_imp = (
-            pd.DataFrame(
-                self._imputer.fit_transform(X[self._num_cols]),
-                columns=self._num_cols,
-                index=X.index,
-            )
-            if self._num_cols else pd.DataFrame(index=X.index)
-        )
-        Xcat = X[self._cat_cols].fillna("__missing__").astype(str) if self._cat_cols else pd.DataFrame(index=X.index)
-
-        y_arr = np.array(y)
+        # Score every feature
         scores: dict[str, float] = {}
+        for col in X.columns:
+            scores[col] = self._feature_score(
+                X[col], y,
+                is_categorical=(col in cat_set),
+                bins=bins_map.get(col),
+            )
 
-        for col in self._num_cols:
-            scores[col] = self._score_column(Xnum_imp[col].to_numpy(), y_arr, is_categorical=False)
+        self._h_scores = pd.Series(scores).sort_values(ascending=False)
+        top_k = min(self.svm_top_k, len(self._h_scores))
+        candidates = list(self._h_scores.head(top_k).index)
 
-        for col in self._cat_cols:
-            scores[col] = self._score_column(Xcat[col].to_numpy(), y_arr, is_categorical=True)
+        if self.use_svm_refinement and len(candidates) > self.n_features:
+            try:
+                X_cand = X[candidates].fillna(X[candidates].median())
+                svc = LinearSVC(
+                    penalty="l1",
+                    C=self.svm_c,
+                    dual=False,
+                    class_weight="balanced",
+                    max_iter=5000,
+                    random_state=42,
+                )
+                svc.fit(X_cand, y)
+                support = np.abs(svc.coef_[0]) > 0
+                svm_selected = [c for c, s in zip(candidates, support) if s]
+                # Fall back to top-k by H score if SVM is too aggressive
+                if len(svm_selected) >= self.n_features:
+                    candidates = svm_selected
+                else:
+                    print(
+                        f"  [Hellinger] L1-SVM too aggressive ({len(svm_selected)} "
+                        f"features); falling back to top-H ranking."
+                    )
+            except Exception as e:
+                print(f"  [Hellinger] L1-SVM refinement failed ({e}); using H-rank only.")
 
-        self._hellinger_scores = pd.Series(scores).sort_values(ascending=False)
-
-        # Optional L1-SVM refinement
-        if self.use_svm_refinement:
-            self._selected_cols = self._svm_refine(X, y, Xnum_imp, Xcat)
-        else:
-            top_k = self.n_features or len(self._hellinger_scores)
-            self._selected_cols = list(self._hellinger_scores.head(top_k).index)
-
-        logger.info(
-            f"HellingerSelector: scored {len(scores)} features, "
-            f"selected {len(self._selected_cols)}."
+        self._selected_cols = candidates[: self.n_features]
+        print(
+            f"  [Hellinger] Selected {len(self._selected_cols)} features "
+            f"(top H score: {self._h_scores.iloc[0]:.4f})"
         )
         return self
 
-    def _svm_refine(
-        self,
-        X: pd.DataFrame,
-        y: pd.Series,
-        Xnum_imp: pd.DataFrame,
-        Xcat: pd.DataFrame,
-    ) -> list[str]:
-        """Apply L1-SVM on Hellinger top-k to determine final feature set."""
-        top_k = min(self.svm_top_k, len(self._hellinger_scores))
-        top_cols = list(self._hellinger_scores.head(top_k).index)
-
-        # Build a simple numeric representation for SVM
-        num_part = [c for c in top_cols if c in self._num_cols]
-        cat_part = [c for c in top_cols if c in self._cat_cols]
-
-        blocks: list[np.ndarray] = []
-        col_names: list[str] = []
-
-        if num_part:
-            blocks.append(Xnum_imp[num_part].to_numpy())
-            col_names.extend(num_part)
-
-        if cat_part:
-            enc = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
-            cat_imp = SimpleImputer(strategy="most_frequent")
-            Xc = cat_imp.fit_transform(X[cat_part].astype(str))
-            Z = enc.fit_transform(Xc)
-            ohe_names = [f"{c}__ohe_{i}" for c, cats in zip(cat_part, enc.categories_) for i in range(len(cats))]
-            blocks.append(Z)
-            col_names.extend(ohe_names)
-
-        if not blocks:
-            n_keep = self.n_features or top_k
-            return list(self._hellinger_scores.head(n_keep).index)
-
-        joint = np.hstack(blocks)
-        svc = LinearSVC(
-            penalty="l1",
-            dual=False,
-            class_weight="balanced",
-            C=self.svm_c,
-            max_iter=8000,
-            random_state=42,
-        )
-        svc.fit(joint, y)
-        coef_strength = np.abs(svc.coef_).max(axis=0)
-
-        # Map OHE columns back to original categorical column names
-        selected_ohe = set(np.array(col_names)[coef_strength > 1e-8])
-        selected: list[str] = []
-        for col in top_cols:
-            if col in self._num_cols and col in selected_ohe:
-                selected.append(col)
-            elif col in self._cat_cols:
-                if any(n.startswith(f"{col}__ohe_") for n in selected_ohe):
-                    selected.append(col)
-
-        # Enforce n_features cap
-        if self.n_features and len(selected) > self.n_features:
-            # Re-rank by Hellinger score
-            selected = sorted(selected, key=lambda c: -self._hellinger_scores.get(c, 0))
-            selected = selected[: self.n_features]
-
-        return selected if selected else list(self._hellinger_scores.head(self.n_features or 50).index)
-
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        """Return the selected feature columns (no projection)."""
-        cols_present = [c for c in self._selected_cols if c in X.columns]
-        return X[cols_present].copy()
+        present = [c for c in self._selected_cols if c in X.columns]
+        return X[present].copy()
 
     @property
-    def hellinger_scores(self) -> pd.Series:
-        """All feature Hellinger scores sorted descending."""
-        return self._hellinger_scores if self._hellinger_scores is not None else pd.Series(dtype=float)
+    def output_dim(self) -> int:
+        return len(self._selected_cols)
+
+    @property
+    def h_scores(self) -> pd.Series:
+        return self._h_scores if self._h_scores is not None else pd.Series(dtype=float)
 
 
 # ---------------------------------------------------------------------------
-# 5. TF-IDF + PCA reducer (lightweight text baseline)
+# DRPipeline — chains reducers sequentially or in parallel
 # ---------------------------------------------------------------------------
 
-class TFIDFEmbeddingReducer(BaseReducer):
-    """Lightweight TF-IDF + TruncatedSVD (LSA) for text columns.
-
-    This is the fallback when sentence-transformers is unavailable and
-    serves as the baseline text encoder described in ``feature_selection.py``.
-
-    Parameters
-    ----------
-    n_components : int
-        Output embedding dimension after SVD.
-    max_features : int
-        TF-IDF vocabulary size cap.
-    ngram_range : tuple
-        TF-IDF n-gram range.
-    min_df : int
-        Minimum document frequency for TF-IDF.
-    """
-
-    name = "tfidf_embedding"
-
-    def __init__(
-        self,
-        n_components: int = 64,
-        max_features: int = 5000,
-        ngram_range: tuple[int, int] = (1, 2),
-        min_df: int = 3,
-        categorical_threshold: int = _DEFAULT_CATEGORICAL_THRESHOLD,
-    ) -> None:
-        self.n_components = n_components
-        self.max_features = max_features
-        self.ngram_range = ngram_range
-        self.min_df = min_df
-        self.categorical_threshold = categorical_threshold
-
-        self._text_cols: list[str] = []
-        self._vectorizer: TfidfVectorizer | None = None
-        self._svd: TruncatedSVD | None = None
-
-    def _to_documents(self, X: pd.DataFrame) -> list[str]:
-        docs = []
-        for _, row in X[self._text_cols].iterrows():
-            tokens = []
-            for col, val in row.items():
-                if pd.isna(val):
-                    continue
-                token = str(val).strip().lower().replace(" ", "_")
-                tokens.append(f"{col}={token}")
-            docs.append(" ".join(tokens))
-        return docs
-
-    def fit(self, X: pd.DataFrame, y: Optional[pd.Series] = None) -> "TFIDFEmbeddingReducer":
-        _, cat_cols, text_cols = detect_column_types(X, self.categorical_threshold)
-        self._text_cols = text_cols + cat_cols  # encode all non-numeric as text tokens
-        if not self._text_cols:
-            self._text_cols = list(X.columns)
-
-        docs = self._to_documents(X)
-        self._vectorizer = TfidfVectorizer(
-            max_features=self.max_features,
-            ngram_range=self.ngram_range,
-            min_df=self.min_df,
-        )
-        Z = self._vectorizer.fit_transform(docs)
-        n_comp = min(self.n_components, min(Z.shape) - 1)
-        self._svd = TruncatedSVD(n_components=n_comp, random_state=42)
-        self._svd.fit(Z)
-        return self
-
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        docs = self._to_documents(X)
-        Z = self._vectorizer.transform(docs)
-        coords = self._svd.transform(Z)
-        cols = self._output_columns("tfidf_emb", coords.shape[1])
-        return pd.DataFrame(coords, columns=cols, index=X.index)
-
-
-# ---------------------------------------------------------------------------
-# 6. LLM Embedding + PCA reducer (Paper [5])
-# ---------------------------------------------------------------------------
-
-class LLMEmbeddingReducer(BaseReducer):
-    """Sentence-encoder + PCA for text columns (Paper [5]).
-
-    Requires ``sentence-transformers`` to be installed::
-
-        pip install sentence-transformers
-
-    Falls back to :class:`TFIDFEmbeddingReducer` if the library is absent or
-    the model cannot be loaded (e.g. no network access).
-
-    Parameters
-    ----------
-    model_name : str
-        HuggingFace sentence-transformer model to use.
-        Recommended: ``"sentence-transformers/all-mpnet-base-v2"``
-    n_components : int
-        Embedding dimension after PCA compression. The Oxford 2025 paper
-        recommends ≤ 128 when labeled minority-class rows are scarce.
-    batch_size : int
-        Encoding batch size.
-    """
-
-    name = "llm_embedding"
-
-    def __init__(
-        self,
-        model_name: str = "sentence-transformers/all-mpnet-base-v2",
-        n_components: int = 64,
-        batch_size: int = 64,
-        categorical_threshold: int = _DEFAULT_CATEGORICAL_THRESHOLD,
-    ) -> None:
-        self.model_name = model_name
-        self.n_components = n_components
-        self.batch_size = batch_size
-        self.categorical_threshold = categorical_threshold
-
-        self._text_cols: list[str] = []
-        self._pca: PCA | None = None
-        self._model = None
-        self._fallback: TFIDFEmbeddingReducer | None = None
-
-    def _try_load_model(self):
-        try:
-            from sentence_transformers import SentenceTransformer  # type: ignore
-            self._model = SentenceTransformer(self.model_name)
-            logger.info(f"Loaded LLM encoder: {self.model_name}")
-        except Exception as exc:
-            logger.warning(
-                f"sentence-transformers unavailable or model load failed ({exc}). "
-                "Falling back to TFIDFEmbeddingReducer."
-            )
-            self._model = None
-
-    def _column_text(self, X: pd.DataFrame) -> list[str]:
-        return [
-            " | ".join(
-                f"{col}: {val}"
-                for col, val in row.items()
-                if not pd.isna(val)
-            )
-            for _, row in X[self._text_cols].iterrows()
-        ]
-
-    def fit(self, X: pd.DataFrame, y: Optional[pd.Series] = None) -> "LLMEmbeddingReducer":
-        _, cat_cols, text_cols = detect_column_types(X, self.categorical_threshold)
-        self._text_cols = text_cols if text_cols else cat_cols
-
-        self._try_load_model()
-        if self._model is None:
-            self._fallback = TFIDFEmbeddingReducer(
-                n_components=self.n_components,
-                categorical_threshold=self.categorical_threshold,
-            )
-            self._fallback.fit(X, y)
-            return self
-
-        texts = self._column_text(X)
-        embeddings = self._model.encode(texts, batch_size=self.batch_size, show_progress_bar=False)
-        n_comp = min(self.n_components, min(embeddings.shape) - 1)
-        self._pca = PCA(n_components=n_comp, random_state=42)
-        self._pca.fit(embeddings)
-        return self
-
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        if self._fallback is not None:
-            return self._fallback.transform(X)
-
-        texts = self._column_text(X)
-        embeddings = self._model.encode(texts, batch_size=self.batch_size, show_progress_bar=False)
-        coords = self._pca.transform(embeddings)
-        cols = self._output_columns("llm_emb", coords.shape[1])
-        return pd.DataFrame(coords, columns=cols, index=X.index)
-
-
-# ---------------------------------------------------------------------------
-# 7. MRL Embedding Reducer (Paper [4])
-# ---------------------------------------------------------------------------
-
-class MRLEmbeddingReducer(BaseReducer):
-    """Matryoshka Representation Learning truncation reducer (Paper [4]).
-
-    Uses an MRL-trained sentence encoder whose early dimensions carry the most
-    information, so truncation to ``target_dim`` is information-optimal.
-
-    Recommended MRL models
-    -----------------------
-    • ``nomic-ai/nomic-embed-text-v1.5``
-    • ``NeuML/pubmedbert-base-embeddings-matryoshka``
-
-    Falls back to :class:`TFIDFEmbeddingReducer` if sentence-transformers is
-    absent.
-
-    Parameters
-    ----------
-    model_name : str
-        MRL-enabled HuggingFace sentence-transformer model.
-    target_dim : int
-        Truncation dimension.  The MRL paper shows 64–128 is superior to
-        post-hoc PCA at these sizes.
-    """
-
-    name = "mrl_embedding"
-
-    def __init__(
-        self,
-        model_name: str = "nomic-ai/nomic-embed-text-v1.5",
-        target_dim: int = 128,
-        batch_size: int = 64,
-        categorical_threshold: int = _DEFAULT_CATEGORICAL_THRESHOLD,
-    ) -> None:
-        self.model_name = model_name
-        self.target_dim = target_dim
-        self.batch_size = batch_size
-        self.categorical_threshold = categorical_threshold
-
-        self._text_cols: list[str] = []
-        self._model = None
-        self._fallback: TFIDFEmbeddingReducer | None = None
-
-    def _column_text(self, X: pd.DataFrame) -> list[str]:
-        return [
-            " | ".join(
-                f"{col}: {val}"
-                for col, val in row.items()
-                if not pd.isna(val)
-            )
-            for _, row in X[self._text_cols].iterrows()
-        ]
-
-    def fit(self, X: pd.DataFrame, y: Optional[pd.Series] = None) -> "MRLEmbeddingReducer":
-        _, cat_cols, text_cols = detect_column_types(X, self.categorical_threshold)
-        self._text_cols = text_cols if text_cols else cat_cols
-
-        try:
-            from sentence_transformers import SentenceTransformer  # type: ignore
-            self._model = SentenceTransformer(self.model_name)
-            logger.info(f"Loaded MRL encoder: {self.model_name}")
-        except Exception as exc:
-            logger.warning(
-                f"MRL model load failed ({exc}). Falling back to TFIDFEmbeddingReducer."
-            )
-            self._model = None
-            self._fallback = TFIDFEmbeddingReducer(
-                n_components=self.target_dim,
-                categorical_threshold=self.categorical_threshold,
-            )
-            self._fallback.fit(X, y)
-        return self
-
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        if self._fallback is not None:
-            return self._fallback.transform(X)
-
-        texts = self._column_text(X)
-        full_emb = self._model.encode(texts, batch_size=self.batch_size, show_progress_bar=False)
-        # MRL truncation: slice first target_dim dimensions
-        truncated = full_emb[:, : self.target_dim]
-        cols = self._output_columns("mrl_emb", truncated.shape[1])
-        return pd.DataFrame(truncated, columns=cols, index=X.index)
-
-
-# ---------------------------------------------------------------------------
-# 8. DRPipeline – sequential composition
-# ---------------------------------------------------------------------------
-
-@dataclass
 class DRPipeline:
-    """Sequential or mixed application of dimensionality-reduction steps.
-
-    In *sequential* mode each step's output feeds the next step.
-    In *parallel* mode each step operates on the original X and outputs
-    are concatenated.
+    """
+    Chain of dimensionality reduction steps.
 
     Parameters
     ----------
-    steps : list of (name, reducer) tuples
-        Ordered list of reducer steps.
-    mode : {"sequential", "parallel"}
-        Composition strategy.
+    steps : list of (name, reducer) tuples.
+    mode : "sequential" | "parallel"
+        sequential → each step's output feeds the next.
+        parallel   → all steps receive the original X; outputs are concatenated.
     keep_original_numeric : bool
-        When mode is ``"parallel"``, also include the imputed original
-        numeric columns alongside the DR outputs.
+        (parallel only) Also append original numeric columns to the concat.
     """
 
-    steps: list[tuple[str, BaseReducer]] = field(default_factory=list)
-    mode: str = "sequential"       # "sequential" | "parallel"
-    keep_original_numeric: bool = False
+    def __init__(
+        self,
+        steps: list[tuple[str, BaseReducer]],
+        mode: str = "sequential",
+        keep_original_numeric: bool = False,
+    ):
+        if mode not in ("sequential", "parallel"):
+            raise ValueError(f"mode must be 'sequential' or 'parallel', got {mode!r}")
+        self.steps = steps
+        self.mode = mode
+        self.keep_original_numeric = keep_original_numeric
+        self._orig_num_cols: list[str] = []
 
-    def fit(self, X: pd.DataFrame, y: Optional[pd.Series] = None) -> "DRPipeline":
+    def fit(self, X: pd.DataFrame, y: pd.Series | None = None) -> "DRPipeline":
         if self.mode == "sequential":
-            Xcur = X
+            current = X
             for name, reducer in self.steps:
-                logger.info(f"DR pipeline fit step: {name}")
-                reducer.fit(Xcur, y)
-                Xcur = reducer.transform(Xcur)
+                print(f"  Fitting {name}...")
+                reducer.fit(current, y)
+                current = reducer.transform(current)
         else:  # parallel
+            if self.keep_original_numeric:
+                self._orig_num_cols, _ = detect_column_types(X)
             for name, reducer in self.steps:
-                logger.info(f"DR pipeline fit step (parallel): {name}")
+                print(f"  Fitting {name}...")
                 reducer.fit(X, y)
         return self
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         if self.mode == "sequential":
-            Xcur = X
+            current = X
             for _, reducer in self.steps:
-                Xcur = reducer.transform(Xcur)
-            return Xcur
+                current = reducer.transform(current)
+            return current
+        else:  # parallel
+            parts = [reducer.transform(X) for _, reducer in self.steps]
+            if self.keep_original_numeric and self._orig_num_cols:
+                present = [c for c in self._orig_num_cols if c in X.columns]
+                parts.append(X[present])
+            result = pd.concat(parts, axis=1)
+            # De-duplicate column names that might appear in multiple blocks
+            result = result.loc[:, ~result.columns.duplicated()]
+            return result
 
-        # Parallel: concatenate all outputs
-        parts: list[pd.DataFrame] = []
-        if self.keep_original_numeric:
-            num_cols = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
-            if num_cols:
-                imp = SimpleImputer(strategy="median")
-                parts.append(
-                    pd.DataFrame(
-                        imp.fit_transform(X[num_cols]),
-                        columns=[f"orig__{c}" for c in num_cols],
-                        index=X.index,
-                    )
-                )
-        for _, reducer in self.steps:
-            parts.append(reducer.transform(X))
-        return pd.concat(parts, axis=1)
-
-    def fit_transform(self, X: pd.DataFrame, y: Optional[pd.Series] = None) -> pd.DataFrame:
+    def fit_transform(self, X: pd.DataFrame, y: pd.Series | None = None) -> pd.DataFrame:
         return self.fit(X, y).transform(X)
 
+    @property
+    def output_dim(self) -> int:
+        if self.mode == "sequential":
+            return self.steps[-1][1].output_dim if self.steps else 0
+        return sum(r.output_dim for _, r in self.steps)
+
 
 # ---------------------------------------------------------------------------
-# Factory – build from config dict
+# Factory: build pipeline from config dict or string shorthand
 # ---------------------------------------------------------------------------
 
-_REDUCER_REGISTRY: dict[str, type[BaseReducer]] = {
-    "mca": MCAReducer,
-    "famd": FAMDReducer,
-    "catpca": CATSCAReducer,
-    "hellinger": HellingerSelector,
-    "tfidf_embedding": TFIDFEmbeddingReducer,
-    "llm_embedding": LLMEmbeddingReducer,
-    "mrl_embedding": MRLEmbeddingReducer,
+_PIPELINE_SHORTHANDS: dict[str, list[dict]] = {
+    "pca": [{"type": "pca"}],
+    "famd": [{"type": "famd"}],
+    "catpca": [{"type": "catpca"}],
+    "hellinger": [{"type": "hellinger"}],
+    # Pipeline A from the design doc: FAMD → Hellinger
+    "famd_hellinger": [
+        {"type": "famd", "n_components": 80},
+        {"type": "hellinger", "n_features": 60, "use_svm_refinement": True},
+    ],
 }
 
 
-def build_dr_pipeline(config: dict[str, Any]) -> DRPipeline | None:
-    """Construct a :class:`DRPipeline` from a YAML-derived config dictionary.
-
-    Config format example
-    ---------------------
-    .. code-block:: yaml
-
-        dimensionality_reduction:
-          mode: sequential          # "sequential" or "parallel"
-          keep_original_numeric: false
-          methods:
-            - type: famd
-              n_components: 50
-            - type: hellinger
-              n_features: 100
-              use_svm_refinement: true
-
-    Parameters
-    ----------
-    config : dict
-        The parsed ``dimensionality_reduction`` sub-dict from the experiment
-        YAML. If the key is absent or ``None``, returns ``None`` (no DR).
-
-    Returns
-    -------
-    DRPipeline or None
+def build_dr_pipeline(config: dict | str | None) -> DRPipeline | None:
     """
-    if not config:
+    Build a DRPipeline from a config dict, string shorthand, or None.
+
+    String shorthands
+    -----------------
+    "pca", "famd", "catpca", "hellinger", "famd_hellinger"
+
+    Dict format
+    -----------
+    {
+      "mode": "sequential",          # optional, default "sequential"
+      "keep_original_numeric": False, # optional
+      "methods": [
+        {"type": "famd", "n_components": 80},
+        {"type": "hellinger", "n_features": 60, "use_svm_refinement": True}
+      ]
+    }
+    """
+    if config is None:
         return None
+
+    if isinstance(config, str):
+        if config not in _PIPELINE_SHORTHANDS:
+            raise ValueError(
+                f"Unknown DR method {config!r}. "
+                f"Available: {list(_PIPELINE_SHORTHANDS.keys())}"
+            )
+        config = {
+            "mode": "sequential",
+            "methods": _PIPELINE_SHORTHANDS[config],
+        }
 
     mode = config.get("mode", "sequential")
-    keep_orig = config.get("keep_original_numeric", False)
-    method_specs = config.get("methods", [])
+    keep_num = config.get("keep_original_numeric", False)
+    methods = config["methods"]
 
-    if not method_specs:
-        return None
-
-    steps: list[tuple[str, BaseReducer]] = []
-    for spec in method_specs:
-        reducer_type = spec.get("type", "").lower()
-        if reducer_type not in _REDUCER_REGISTRY:
+    steps = []
+    for i, method_cfg in enumerate(methods):
+        method_cfg = dict(method_cfg)          # don't mutate caller's dict
+        type_name = method_cfg.pop("type")
+        if type_name not in _REDUCER_REGISTRY:
             raise ValueError(
-                f"Unknown DR method '{reducer_type}'. "
-                f"Available: {list(_REDUCER_REGISTRY)}"
+                f"Unknown reducer type {type_name!r}. "
+                f"Registered: {list_reducers()}"
             )
-        klass = _REDUCER_REGISTRY[reducer_type]
-        kwargs = {k: v for k, v in spec.items() if k != "type"}
-        try:
-            reducer = klass(**kwargs)
-        except TypeError as exc:
-            raise ValueError(
-                f"Invalid parameters for '{reducer_type}': {exc}"
-            ) from exc
-        steps.append((reducer_type, reducer))
+        reducer_cls = _REDUCER_REGISTRY[type_name]
+        reducer = reducer_cls(**method_cfg)
+        steps.append((f"{type_name}_{i}", reducer))
 
-    return DRPipeline(steps=steps, mode=mode, keep_original_numeric=keep_orig)
+    return DRPipeline(steps=steps, mode=mode, keep_original_numeric=keep_num)
 
 
 # ---------------------------------------------------------------------------
-# Convenience: apply DR inside prepare_modeling_dataset
+# PreprocessedSplit dataclass (updated)
 # ---------------------------------------------------------------------------
 
-def apply_dr_to_prepared_dataset(
-    X: pd.DataFrame,
-    y: pd.Series,
-    dr_config: dict[str, Any] | None,
-) -> tuple[pd.DataFrame, "DRPipeline | None"]:
-    """Fit and apply a DR pipeline to a modeling matrix.
+@dataclass
+class PreprocessedSplit:
+    """
+    Holds all relevant data after preprocessing + dimensionality reduction.
+
+    Preprocessed (imputed + scaled, before DR)
+    -------------------------------------------
+    X_train_preprocessed : shape (n_train, n_features_original)
+    X_test_preprocessed  : shape (n_test,  n_features_original)
+
+    DR-reduced
+    ----------
+    X_train : shape (n_train, n_reduced)
+    X_test  : shape (n_test,  n_reduced)
+    """
+    X_train: pd.DataFrame
+    X_test: pd.DataFrame
+    X_train_preprocessed: pd.DataFrame
+    X_test_preprocessed: pd.DataFrame
+    y_train: pd.Series
+    y_test: pd.Series
+    dr_method: str
+    n_components: int
+    explained_variance_ratio: np.ndarray
+    cumulative_variance: float
+    feature_names_in: list[str]
+    train_medians: pd.Series
+
+
+# ---------------------------------------------------------------------------
+# ClinicalPreprocessor (updated to use DRPipeline)
+# ---------------------------------------------------------------------------
+
+class ClinicalPreprocessor:
+    """
+    Fit on training data, transform train and test.
+
+    Steps
+    -----
+    1. Median imputation (train medians only).
+    2. StandardScaler.
+    3. DR pipeline (optional).
 
     Parameters
     ----------
-    X : pd.DataFrame
-        Full feature matrix (after missingness filtering, leakage removal).
-    y : pd.Series
-        Target vector for supervised selectors (e.g. HellingerSelector).
-    dr_config : dict or None
-        Parsed ``dimensionality_reduction`` config block.
-
-    Returns
-    -------
-    X_reduced : pd.DataFrame
-    pipeline : DRPipeline or None
+    dr_config : str | dict | None
+        Passed to build_dr_pipeline. If None, only imputation + scaling is done.
     """
-    if not dr_config:
-        return X, None
 
-    pipeline = build_dr_pipeline(dr_config)
-    if pipeline is None:
-        return X, None
+    def __init__(self, dr_config: str | dict | None = "pca"):
+        self.dr_config = dr_config
+        self._medians: pd.Series | None = None
+        self._scaler: StandardScaler | None = None
+        self._pipeline: DRPipeline | None = None
+        self._feature_names: list[str] = []
 
-    logger.info(
-        f"Applying DR pipeline ({pipeline.mode} mode, "
-        f"{len(pipeline.steps)} step(s)) to matrix of shape {X.shape}."
+    def fit(self, X_train: pd.DataFrame, y_train: pd.Series | None = None) -> "ClinicalPreprocessor":
+        self._feature_names = list(X_train.columns)
+
+        # 1. Impute
+        self._medians = X_train.median(numeric_only=True)
+        X_imp = X_train.fillna(self._medians)
+
+        # 2. Scale
+        self._scaler = StandardScaler()
+        X_scaled_arr = self._scaler.fit_transform(X_imp)
+        X_scaled = pd.DataFrame(X_scaled_arr, index=X_train.index, columns=X_train.columns)
+
+        # 3. DR pipeline
+        if self.dr_config is not None:
+            self._pipeline = build_dr_pipeline(self.dr_config)
+            # For supervised reducers (Hellinger), pass y_train
+            self._pipeline.fit(X_scaled, y_train)
+
+        return self
+
+    def transform_preprocessed(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Return imputed + scaled data (before DR)."""
+        X_imp = X.fillna(self._medians)
+        X_scaled_arr = self._scaler.transform(X_imp)
+        return pd.DataFrame(X_scaled_arr, index=X.index, columns=X.columns)
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Return DR-reduced data."""
+        X_pre = self.transform_preprocessed(X)
+        if self._pipeline is None:
+            return X_pre
+        return self._pipeline.transform(X_pre)
+
+    def fit_transform(self, X_train: pd.DataFrame, y_train: pd.Series | None = None) -> pd.DataFrame:
+        return self.fit(X_train, y_train).transform(X_train)
+
+    @property
+    def n_components(self) -> int:
+        if self._pipeline is None:
+            return len(self._feature_names)
+        return self._pipeline.output_dim
+
+    @property
+    def explained_variance_ratio(self) -> np.ndarray:
+        if self._pipeline is None:
+            return np.array([])
+        # Extract from PCA/FAMD reducer if available
+        for _, reducer in self._pipeline.steps:
+            if hasattr(reducer, "explained_variance_ratio"):
+                return reducer.explained_variance_ratio
+        return np.array([])
+
+
+# ---------------------------------------------------------------------------
+# Main function: split → preprocess → DR → save all CSVs
+# ---------------------------------------------------------------------------
+
+def preprocess_and_reduce(
+    X: pd.DataFrame,
+    y: pd.Series,
+    dr_config: str | dict | None = "pca",
+    test_size: float = 0.20,
+    random_state: int = 42,
+    output_dir: Path = Path("results"),
+) -> PreprocessedSplit:
+    """
+    Stratified split → fit preprocessor on train → transform both splits.
+    Saves four CSVs under output_dir / {method_name}/:
+      train_preprocessed.csv, test_preprocessed.csv
+      train_{method}.csv, test_{method}.csv
+
+    Parameters
+    ----------
+    X, y         : feature matrix and labels from load_clinical_dataset()
+    dr_config    : string shorthand, config dict, or None (no DR)
+    test_size    : fraction held out for evaluation
+    random_state : reproducibility seed
+    output_dir   : base results directory
+    """
+    from sklearn.model_selection import train_test_split
+
+    # Determine method name for output directory
+    if dr_config is None:
+        method_name = "no_dr"
+    elif isinstance(dr_config, str):
+        method_name = dr_config
+    else:
+        method_name = "_".join(m["type"] for m in dr_config.get("methods", []))
+
+    run_dir = Path(output_dir) / method_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- 1. Split -----------------------------------------------------------
+    X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=random_state, stratify=y
     )
-    X_reduced = pipeline.fit_transform(X, y)
-    logger.info(f"DR complete. Output shape: {X_reduced.shape}.")
-    return X_reduced, pipeline
+    print(
+        f"[preprocess] Split → train: {len(X_train_raw)} "
+        f"(AP={int((y_train==1).sum())}), "
+        f"test: {len(X_test_raw)} (AP={int((y_test==1).sum())})"
+    )
+
+    # ---- 2. Fit preprocessor on train only ----------------------------------
+    preprocessor = ClinicalPreprocessor(dr_config=dr_config)
+    preprocessor.fit(X_train_raw, y_train)
+
+    # ---- 3. Transform -------------------------------------------------------
+    X_train_pre = preprocessor.transform_preprocessed(X_train_raw)
+    X_test_pre  = preprocessor.transform_preprocessed(X_test_raw)
+    X_train_dr  = preprocessor.transform(X_train_raw)
+    X_test_dr   = preprocessor.transform(X_test_raw)
+
+    # ---- 4. Save CSVs -------------------------------------------------------
+    def _save(df: pd.DataFrame, labels: pd.Series, fname: str) -> None:
+        out = df.copy()
+        out.insert(0, "label", labels.values)
+        out.insert(0, "project_key", labels.index)
+        out.to_csv(run_dir / fname, index=False)
+        print(f"  Saved {run_dir / fname}  {df.shape}")
+
+    _save(X_train_pre, y_train, "train_preprocessed.csv")
+    _save(X_test_pre,  y_test,  "test_preprocessed.csv")
+    _save(X_train_dr,  y_train, f"train_{method_name}.csv")
+    _save(X_test_dr,   y_test,  f"test_{method_name}.csv")
+
+    evr = preprocessor.explained_variance_ratio
+    return PreprocessedSplit(
+        X_train=X_train_dr,
+        X_test=X_test_dr,
+        X_train_preprocessed=X_train_pre,
+        X_test_preprocessed=X_test_pre,
+        y_train=y_train,
+        y_test=y_test,
+        dr_method=method_name,
+        n_components=preprocessor.n_components,
+        explained_variance_ratio=evr,
+        cumulative_variance=float(evr.sum()) if len(evr) > 0 else 0.0,
+        feature_names_in=preprocessor._feature_names,
+        train_medians=preprocessor._medians,
+    )
