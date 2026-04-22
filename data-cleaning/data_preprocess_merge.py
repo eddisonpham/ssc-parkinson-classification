@@ -67,24 +67,41 @@ def split_and_create_boolean_columns(df, col):
         )
     return df
 
+def merge_csv_files(filepaths, key_column="Project key"):
+    """Merge multiple CSV files on a common key column."""
+    dfs = []
+    for filepath in filepaths:
+        df = pd.read_csv(filepath)
+        dfs.append(df)
+    
+    merged_df = dfs[0]
+    for df in dfs[1:]:
+        merged_df = merged_df.merge(df, on=key_column, how='outer')
+    
+    return merged_df
+
 if __name__ == "__main__":
     filepaths = [
         "epidemiological.csv",
         "fatigue_severity_scale.csv",
         "mds-updrs.csv",
         "mds-updrs-1.csv",
-        "schwab_&_england.csv"
+        "schwab_&_england.csv",
+        "parkinson_severity_scale.csv"
         ]
     delete_columns = {
         "epidemiological.csv" : [
+            "Questionnaire completed:     Questionnaire rempli:  ", #comment if want to keep date
             "Event Name", 
             "How is the questionnaire completed?     Comment le questionnaire est-il rempli?"
             ],
         "fatigue_severity_scale.csv" : [
+            "Questionnaire completed:     Questionnaire rempli:",#comment if want to keep date
             "How is the questionnaire completed?     Comment le questionnaire est-il rempli?",
             "Divided by 9"
             ],
         "mds-updrs.csv" : [
+            "Assessment completed:     Évaluation remplie:  ",#comment if want to keep date
             "Assessment completed by:     Évaluation complétée par:",
             "How was the MDS-UPDRS administered?   Comment le MDS-UPDRS a-t-il été administré?",
             "Is it UPDRS v1.2 (part3) legacy ?  S'agit il d'un héritage de UPDRS v1.2 (partie 3) ?",
@@ -140,6 +157,7 @@ if __name__ == "__main__":
             "Updrs_4_6 value",
         ],
         "mds-updrs-1.csv" : [
+            "Assessment completed:     Évaluation remplie:  ", #comment to keep date
             "Assessment completed by:     Évaluation complétée par:",
             "How was the MDS-UPDRS administered?   Comment le MDS-UPDRS a-t-il été administré?",
             "Is it UPDRS v1.2 (part3) legacy ?  S'agit il d'un héritage de UPDRS v1.2 (partie 3) ?",
@@ -194,7 +212,13 @@ if __name__ == "__main__":
             "Updrs_4_6 value"
         ],
         "schwab_&_england.csv" : [
+            "Questionnaire completed:     Questionnaire rempli:", #comment if want to keep date
             "How is the questionnaire completed?     Comment le questionnaire est-il rempli?"
+        ],
+        "parkinson_severity_scale.csv" : [
+            "Questionnaire completed:     Questionnaire rempli:", #comment if want to keep date
+            "How is the questionnaire completed?     Comment le questionnaire est-il rempli?",
+            "Event Name"
         ]
         }
     check_all_type_columns = {
@@ -210,7 +234,8 @@ if __name__ == "__main__":
         "fatigue_severity_scale.csv" : [],
         "mds-updrs-1.csv": [],
         "mds-updrs.csv": [],
-        "schwab_&_england.csv" : []
+        "schwab_&_england.csv" : [],
+        "parkinson_severity_scale.csv" : []
     }
 
     for file in filepaths:
@@ -234,8 +259,16 @@ if __name__ == "__main__":
         convert_numerical_strings(df)
         
         # change all column names to filename_column name to ensure uniqueness
-        df.columns = [f"{file.replace('.csv', '')}_{col}" for col in df.columns]
+        df.columns = [col if col == "Project key" else f"{file.replace('.csv', '')}_{col}" for col in df.columns]
 
         checking(df)
         cleaned_filename = "cleaned_" + file
         df.to_csv(cleaned_filename, index=False)
+    
+    cleaned_filepaths = []
+    for file in filepaths:
+        cleaned = "cleaned_" + file
+        cleaned_filepaths.append(cleaned)
+
+    merged_df = merge_csv_files(cleaned_filepaths, key_column="Project key")
+    merged_df.to_csv("master_cleaned_dataset.csv", index=False)
